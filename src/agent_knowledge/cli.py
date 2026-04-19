@@ -91,6 +91,79 @@ def status():
     conn.close()
 
 
+@main.command()
+@click.option("--project", "-p", default=None, help="Filter by project name or ID.")
+@click.option("--date", "-d", default=None, help="Filter by date (YYYY-MM-DD).")
+def sessions(project: str | None, date: str | None):
+    """List recent sessions with summaries."""
+    config = load_config()
+    if not config.sessions_db.exists():
+        click.echo("Not initialized. Run 'akw init' first.")
+        return
+
+    conn = storage.connect(config.sessions_db)
+
+    # Resolve project name to ID if needed
+    project_id = None
+    if project:
+        projects = storage.list_projects(conn)
+        for p in projects:
+            if p["id"] == project or p["name"] == project:
+                project_id = p["id"]
+                break
+        if project_id is None:
+            click.echo(f"Project not found: {project}")
+            conn.close()
+            return
+
+    results = storage.list_sessions(conn, project_id=project_id, date=date)
+    if not results:
+        click.echo("No sessions found.")
+        conn.close()
+        return
+
+    for s in results:
+        turns = storage.get_turns(conn, s["id"])
+        status = "reviewed" if s["reviewed_at"] else ("ended" if s["ended_at"] else "active")
+        click.echo(f"\n[{status}] {s['started_at'][:16]} | {s['agent']} | {s['type']}")
+        click.echo(f"  ID: {s['id'][:12]}... | Turns: {len(turns)}")
+        if turns:
+            click.echo(f"  Last: {turns[-1]['request'][:80]}")
+
+    conn.close()
+
+
+@main.command("search")
+@click.argument("query")
+@click.option("--tier", "-t", default=None, help="Filter by tier: knowledge or skill.")
+def search_cmd(query: str, tier: str | None):
+    """Search memory from the terminal."""
+    config = load_config()
+    if not config.search_db.exists():
+        click.echo("Search index not built. Run 'akw init' first.")
+        return
+
+    duckdb_conn = search.connect(config.search_db)
+
+    # Sync before searching
+    if config.memory_dir.exists():
+        search.sync_from_files(duckdb_conn, config.memory_dir)
+
+    results = search.search(duckdb_conn, query, tier)
+    if not results:
+        click.echo("No results found.")
+        duckdb_conn.close()
+        return
+
+    for r in results:
+        click.echo(f"  [{r['tier']}] {r['path']}")
+        if r.get("summary"):
+            click.echo(f"    {r['summary'][:100]}")
+
+    click.echo(f"\n{len(results)} results.")
+    duckdb_conn.close()
+
+
 def _find_migrations_dir() -> Path | None:
     """Find db/migrations/ relative to the package or cwd."""
     candidates = [

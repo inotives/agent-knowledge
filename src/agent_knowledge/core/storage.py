@@ -136,6 +136,50 @@ def close_orphaned_sessions(conn: sqlite3.Connection, older_than_hours: int = 24
     return orphans
 
 
+def get_unreviewed_sessions(
+    conn: sqlite3.Connection,
+    project_id: str | None = None,
+    exclude_today: bool = True,
+) -> list[dict]:
+    """Get sessions that ended but haven't been reviewed yet.
+
+    By default excludes today's sessions (still accumulating).
+    """
+    query = """SELECT * FROM sessions
+        WHERE ended_at IS NOT NULL
+        AND reviewed_at IS NULL"""
+    params: list = []
+    if exclude_today:
+        query += " AND date(started_at) < date('now')"
+    if project_id:
+        query += " AND project_id = ?"
+        params.append(project_id)
+    query += " ORDER BY started_at ASC"
+    rows = conn.execute(query, params).fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
+def get_sessions_needing_drafts(conn: sqlite3.Connection) -> list[dict]:
+    """Get ended sessions that have turns but no session draft in memory_edits.
+
+    These are sessions where the agent crashed before writing a session draft.
+    """
+    rows = conn.execute(
+        """SELECT s.* FROM sessions s
+        WHERE s.ended_at IS NOT NULL
+        AND s.reviewed_at IS NULL
+        AND EXISTS (SELECT 1 FROM turns t WHERE t.session_id = s.id)
+        AND NOT EXISTS (
+            SELECT 1 FROM memory_edits me
+            WHERE me.session_id = s.id
+            AND me.page_path LIKE 'drafts/sessions/%'
+            AND me.action = 'create'
+        )
+        ORDER BY s.started_at ASC""",
+    ).fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
 # --- Turns ---
 
 def create_turns(
@@ -196,6 +240,19 @@ def get_memory_history(
     params.append(limit)
     rows = conn.execute(query, params).fetchall()
     return [_row_to_dict(r) for r in rows]
+
+
+def get_session_draft_path(conn: sqlite3.Connection, session_id: str) -> str | None:
+    """Find the session draft file path for a given session via memory_edits."""
+    row = conn.execute(
+        """SELECT page_path FROM memory_edits
+        WHERE session_id = ?
+        AND page_path LIKE 'drafts/sessions/%'
+        AND action = 'create'
+        ORDER BY created_at DESC LIMIT 1""",
+        (session_id,),
+    ).fetchone()
+    return row["page_path"] if row else None
 
 
 # --- Helpers ---

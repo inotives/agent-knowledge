@@ -157,7 +157,7 @@ def memory_history(limit: int = 20, page_path: str | None = None) -> list[dict]:
 # --- Memory Write ---
 
 @mcp.tool()
-def memory_create(path: str, title: str, content: str, tags: list[str] | None = None, summary: str = "") -> dict:
+def memory_create(path: str, title: str, content: str, tags: list[str] | None = None, summary: str = "", session_id: str | None = None) -> dict:
     """Create a new memory page in any tier.
 
     Args:
@@ -166,6 +166,7 @@ def memory_create(path: str, title: str, content: str, tags: list[str] | None = 
         content: Full markdown content.
         tags: Optional category tags.
         summary: Short description for index.
+        session_id: Optional — links this page to the originating session (used for session drafts).
     """
     try:
         # Build frontmatter
@@ -174,7 +175,7 @@ def memory_create(path: str, title: str, content: str, tags: list[str] | None = 
 
         # Record edit
         tier = memory.get_tier(path) or "draft"
-        storage.create_memory_edit(_sqlite_conn, path, tier, "create", summary or f"Created {title}")
+        storage.create_memory_edit(_sqlite_conn, path, tier, "create", summary or f"Created {title}", session_id=session_id)
 
         # Re-sync search index if curated tier
         if tier in ("knowledge", "skill"):
@@ -230,6 +231,146 @@ def memory_delete(path: str, reason: str = "") -> dict:
         return {"error": f"Page not found: {path}"}
 
 
+# --- Review ---
+
+@mcp.tool()
+def review_get_pending(project_id: str | None = None) -> dict:
+    """Get all items needing review.
+
+    Returns two types:
+    (1) Orphaned sessions — ended sessions with turns but no session draft
+        (agent crashed before writing draft). Agent should generate drafts from raw turns.
+    (2) Unreviewed session drafts from previous days — ready for daily review synthesis.
+
+    Args:
+        project_id: Optional — filter by project.
+    """
+    # Orphaned sessions needing draft generation
+    orphans = storage.get_sessions_needing_drafts(_sqlite_conn)
+    orphan_data = []
+    for session in orphans:
+        if project_id and session["project_id"] != project_id:
+            continue
+        turns = storage.get_turns(_sqlite_conn, session["id"])
+        orphan_data.append({"session": session, "turns": turns})
+
+    # Unreviewed session drafts from previous days
+    unreviewed = storage.get_unreviewed_sessions(_sqlite_conn, project_id=project_id)
+    unreviewed_drafts = []
+    for session in unreviewed:
+        draft_path = storage.get_session_draft_path(_sqlite_conn, session["id"])
+        if draft_path:
+            try:
+                content = memory.read_page(_config.memory_dir, draft_path)
+                unreviewed_drafts.append({
+                    "session": session,
+                    "draft_path": draft_path,
+                    "content": content,
+                })
+            except FileNotFoundError:
+                # Draft file missing — treat as orphan
+                turns = storage.get_turns(_sqlite_conn, session["id"])
+                orphan_data.append({"session": session, "turns": turns})
+
+    return {
+        "orphaned_sessions": orphan_data,
+        "unreviewed_drafts": unreviewed_drafts,
+    }
+
+
+@mcp.tool()
+def review_complete(session_ids: list[str]) -> dict:
+    """Mark daily review as done for the given sessions.
+
+    Sets reviewed_at on each session and deletes their session draft files
+    from /memory/drafts/sessions/ (knowledge has been synthesized into knowledge drafts).
+
+    Args:
+        session_ids: List of session IDs that were processed in the review.
+    """
+    deleted_drafts = []
+    for sid in session_ids:
+        storage.set_session_reviewed(_sqlite_conn, sid)
+
+        # Find and delete the session draft file
+        draft_path = storage.get_session_draft_path(_sqlite_conn, sid)
+        if draft_path:
+            try:
+                memory.delete_page(_config.memory_dir, draft_path)
+                deleted_drafts.append(draft_path)
+            except FileNotFoundError:
+                pass
+
+    return {
+        "sessions_reviewed": len(session_ids),
+        "drafts_deleted": deleted_drafts,
+    }
+
+
+# --- Promotion ---
+
+@mcp.tool()
+def promote_to_knowledge(draft_path: str, target_path: str) -> dict:
+    """Move a knowledge draft into curated knowledge.
+
+    Operates on files in /memory/drafts/knowledge/ (not session drafts).
+
+    Args:
+        draft_path: Source path in /memory/drafts/knowledge/.
+        target_path: Destination path in /memory/knowledge/.
+    """
+    if not draft_path.startswith("drafts/knowledge/"):
+        return {"error": "Can only promote from drafts/knowledge/"}
+    if not target_path.startswith("knowledge/"):
+        return {"error": "Target must be in knowledge/"}
+
+    try:
+        memory.move_page(_config.memory_dir, draft_path, target_path)
+
+        storage.create_memory_edit(
+            _sqlite_conn, draft_path, "draft", "delete", f"Promoted to {target_path}")
+        storage.create_memory_edit(
+            _sqlite_conn, target_path, "knowledge", "create", f"Promoted from {draft_path}")
+
+        search.sync_from_files(_duckdb_conn, _config.memory_dir)
+
+        return {"status": "promoted", "from": draft_path, "to": target_path}
+    except FileNotFoundError:
+        return {"error": f"Draft not found: {draft_path}"}
+    except FileExistsError:
+        return {"error": f"Target already exists: {target_path}"}
+
+
+@mcp.tool()
+def promote_to_skill(source_path: str, target_path: str) -> dict:
+    """Move a knowledge page into skills. This is a user/human-driven action.
+
+    Args:
+        source_path: Source path in /memory/knowledge/.
+        target_path: Destination path in /memory/skills/.
+    """
+    if not source_path.startswith("knowledge/"):
+        return {"error": "Can only promote from knowledge/"}
+    if not target_path.startswith("skills/"):
+        return {"error": "Target must be in skills/"}
+
+    try:
+        memory.move_page(_config.memory_dir, source_path, target_path)
+
+        storage.create_memory_edit(
+            _sqlite_conn, source_path, "knowledge", "delete", f"Promoted to {target_path}")
+        storage.create_memory_edit(
+            _sqlite_conn, target_path, "skill", "create", f"Promoted from {source_path}")
+
+        search.sync_from_files(_duckdb_conn, _config.memory_dir)
+
+        return {"status": "promoted", "from": source_path, "to": target_path}
+    except FileNotFoundError:
+        return {"error": f"Source not found: {source_path}"}
+    except FileExistsError:
+        return {"error": f"Target already exists: {target_path}"}
+
+
 # --- Maintenance ---
 
 @mcp.tool()
@@ -242,31 +383,36 @@ def maintain_reindex() -> dict:
 # --- Helpers ---
 
 def _get_recommended_context(project: dict | None) -> list[dict]:
-    """Get matching skills and recent knowledge for a project."""
+    """Get matching skills and recent knowledge for a project, with content inline."""
     if not project:
         return []
 
-    results = []
+    paths: list[str] = []
     tags = project.get("tags", [])
 
     # Match skills by project tags
     for tag in tags:
         skill_results = search.search(_duckdb_conn, tag, tier="skill")
-        results.extend(skill_results)
+        paths.extend(r["path"] for r in skill_results)
 
     # Add recent knowledge
     knowledge = search.get_index(_duckdb_conn, tier="knowledge")
-    results.extend(knowledge[:5])
+    paths.extend(r["path"] for r in knowledge[:5])
 
-    # Deduplicate by path
+    # Deduplicate and load content
     seen = set()
-    unique = []
-    for r in results:
-        if r["path"] not in seen:
-            seen.add(r["path"])
-            unique.append(r)
+    results = []
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            content = memory.read_page(_config.memory_dir, path)
+            results.append({"path": path, "content": content})
+        except FileNotFoundError:
+            continue
 
-    return unique
+    return results
 
 
 def _build_page(title: str, content: str, tags: list[str] | None, summary: str) -> str:
