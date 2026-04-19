@@ -8,10 +8,12 @@ dependencies = [
     "mcp",
     "duckdb",
     "click",
+    "anthropic",
 ]
 
 [project.scripts]
 akw = "agent_knowledge.cli:main"
+agent-knowledge-server = "agent_knowledge.server:main"
 
 [build-system]
 requires = ["hatchling"]

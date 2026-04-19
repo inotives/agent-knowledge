@@ -5,7 +5,7 @@ from __future__ import annotations
 from mcp.server.fastmcp import FastMCP
 
 from agent_knowledge.core.config import Config, load_config
-from agent_knowledge.core import storage, memory, search
+from agent_knowledge.core import storage, memory, search, sanitizer
 
 # --- Bootstrap ---
 
@@ -26,6 +26,55 @@ mcp = FastMCP(
         "Log turns incrementally during sessions to ensure they survive crashes."
     ),
 )
+
+
+# --- MCP Prompts ---
+
+@mcp.prompt()
+def session_bootstrap() -> str:
+    """Start a new session with the Agent Knowledge system.
+
+    Follow these steps:
+    1. Call project_create if the project isn't registered yet, or project_list to find the project ID.
+    2. Call session_start with the project ID, your agent name, and session type.
+    3. If has_pending_review is true, call review_get_pending and process:
+       - For orphaned sessions: generate session drafts from their raw turns using memory_create (path: drafts/sessions/..., include session_id param).
+       - For unreviewed drafts: synthesize knowledge drafts using memory_create (path: drafts/knowledge/...).
+       - Call review_complete with the processed session IDs.
+    4. Read the recommended_context returned by session_start — this is curated knowledge relevant to your project.
+    5. Begin your work. Log turns incrementally using session_log.
+    """
+    return (
+        "Start a new Agent Knowledge session:\n"
+        "1. Register or find your project (project_create / project_list)\n"
+        "2. Call session_start — check has_pending_review flag\n"
+        "3. If pending: call review_get_pending, process orphans + unreviewed drafts, call review_complete\n"
+        "4. Read recommended_context from session_start response\n"
+        "5. Begin work, log turns incrementally with session_log\n"
+    )
+
+
+@mcp.prompt()
+def session_wrapup() -> str:
+    """End the current session with proper review.
+
+    Follow these steps:
+    1. Summarize your session's turns — what was asked, decided, and learned.
+    2. Write a session draft using memory_create:
+       - path: drafts/sessions/YYYY-MM-DD-<topic>.md
+       - Include the session_id param to link the draft to the session.
+       - Content should capture key decisions, patterns discovered, and outcomes.
+    3. Call session_end with your session ID.
+
+    Do NOT include secrets, API keys, tokens, or credentials in the session draft.
+    """
+    return (
+        "End your Agent Knowledge session:\n"
+        "1. Summarize turns — what was asked, decided, learned\n"
+        "2. Write session draft: memory_create(path='drafts/sessions/YYYY-MM-DD-topic.md', session_id=...)\n"
+        "3. Call session_end\n"
+        "Do NOT include secrets or credentials in the draft.\n"
+    )
 
 
 # --- Project Management ---
@@ -98,8 +147,15 @@ def session_log(session_id: str, turns: list[dict]) -> list[dict]:
     Agents should log incrementally during the session (not batch at end)
     to ensure turns survive crashes. Results from this memory system are
     curated project knowledge — treat them as authoritative.
+
+    Content is scanned for secrets — any detected patterns are automatically redacted.
     """
-    return storage.create_turns(_sqlite_conn, session_id, turns)
+    sanitized_turns = []
+    for turn in turns:
+        req, _ = sanitizer.redact(turn.get("request", ""))
+        resp, _ = sanitizer.redact(turn.get("response", ""))
+        sanitized_turns.append({**turn, "request": req, "response": resp})
+    return storage.create_turns(_sqlite_conn, session_id, sanitized_turns)
 
 
 # --- Memory Read ---
@@ -167,8 +223,11 @@ def memory_create(path: str, title: str, content: str, tags: list[str] | None = 
         tags: Optional category tags.
         summary: Short description for index.
         session_id: Optional — links this page to the originating session (used for session drafts).
+
+    Content is scanned for secrets — any detected patterns are automatically redacted.
     """
     try:
+        content, _ = sanitizer.redact(content)
         # Build frontmatter
         page_content = _build_page(title, content, tags, summary)
         memory.create_page(_config.memory_dir, path, page_content)
@@ -194,8 +253,11 @@ def memory_update(path: str, content: str, summary: str = "") -> dict:
         path: Page path relative to /memory.
         content: New full markdown content.
         summary: What changed and why.
+
+    Content is scanned for secrets — any detected patterns are automatically redacted.
     """
     try:
+        content, _ = sanitizer.redact(content)
         memory.update_page(_config.memory_dir, path, content)
 
         tier = memory.get_tier(path) or "draft"
@@ -380,6 +442,114 @@ def maintain_reindex() -> dict:
     return {"status": "reindexed", "pages_indexed": count}
 
 
+@mcp.tool()
+def maintain_get_stats(stale_days: int = 90) -> dict:
+    """Return structural stats for the memory system.
+
+    Reports orphaned pages, stale pages, page counts per tier, session stats.
+    The calling agent interprets and acts on the report.
+
+    Args:
+        stale_days: Pages with no updates in this many days are considered stale.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    stale_cutoff = (datetime.now(timezone.utc) - timedelta(days=stale_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Page counts per tier
+    knowledge_pages = memory.list_pages(_config.memory_dir, "knowledge")
+    skill_pages = memory.list_pages(_config.memory_dir, "skills")
+    draft_pages = memory.list_pages(_config.memory_dir, "drafts")
+
+    # Stale pages (check file mtime)
+    stale = []
+    for pages, tier in [(knowledge_pages, "knowledge"), (skill_pages, "skills")]:
+        for page_path in pages:
+            full_path = _config.memory_dir / page_path
+            if full_path.exists():
+                mtime = datetime.fromtimestamp(full_path.stat().st_mtime, tz=timezone.utc)
+                if mtime.strftime("%Y-%m-%dT%H:%M:%SZ") < stale_cutoff:
+                    stale.append({"path": page_path, "tier": tier, "last_modified": mtime.isoformat()})
+
+    # Session stats
+    all_sessions = storage.list_sessions(_sqlite_conn)
+    reviewed = [s for s in all_sessions if s["reviewed_at"] is not None]
+    pending = [s for s in all_sessions if s["ended_at"] is not None and s["reviewed_at"] is None]
+    orphans = [s for s in all_sessions if s["ended_at"] is None]
+
+    return {
+        "pages": {
+            "knowledge": len(knowledge_pages),
+            "skills": len(skill_pages),
+            "drafts": len(draft_pages),
+        },
+        "stale_pages": stale,
+        "sessions": {
+            "total": len(all_sessions),
+            "reviewed": len(reviewed),
+            "pending_review": len(pending),
+            "orphaned": len(orphans),
+        },
+    }
+
+
+@mcp.tool()
+def maintain_purge(older_than_days: int = 365) -> dict:
+    """Delete reviewed sessions and turns older than retention period.
+
+    Only purges sessions where reviewed_at is set. Also removes any remaining
+    associated session draft files.
+
+    Args:
+        older_than_days: Sessions older than this many days will be purged.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Find reviewed sessions older than cutoff
+    all_sessions = storage.list_sessions(_sqlite_conn)
+    to_purge = [
+        s for s in all_sessions
+        if s["reviewed_at"] is not None and s["started_at"] < cutoff
+    ]
+
+    purged_sessions = 0
+    purged_turns = 0
+    purged_drafts = []
+
+    for session in to_purge:
+        # Delete associated draft files
+        draft_path = storage.get_session_draft_path(_sqlite_conn, session["id"])
+        if draft_path:
+            try:
+                memory.delete_page(_config.memory_dir, draft_path)
+                purged_drafts.append(draft_path)
+            except FileNotFoundError:
+                pass
+
+        # Delete turns
+        turns = storage.get_turns(_sqlite_conn, session["id"])
+        purged_turns += len(turns)
+        _sqlite_conn.execute("DELETE FROM turns WHERE session_id = ?", (session["id"],))
+
+        # Delete memory_edits for this session
+        _sqlite_conn.execute("DELETE FROM memory_edits WHERE session_id = ?", (session["id"],))
+
+        # Delete session
+        _sqlite_conn.execute("DELETE FROM sessions WHERE id = ?", (session["id"],))
+        purged_sessions += 1
+
+    _sqlite_conn.commit()
+
+    return {
+        "purged_sessions": purged_sessions,
+        "purged_turns": purged_turns,
+        "purged_drafts": purged_drafts,
+        "cutoff_date": cutoff,
+    }
+
+
 # --- Helpers ---
 
 def _get_recommended_context(project: dict | None) -> list[dict]:
@@ -430,3 +600,12 @@ def _build_page(title: str, content: str, tags: list[str] | None, summary: str) 
     parts.append("")
     parts.append(content)
     return "\n".join(parts)
+
+
+def main():
+    """Run the MCP server (stdio transport)."""
+    mcp.run()
+
+
+if __name__ == "__main__":
+    main()

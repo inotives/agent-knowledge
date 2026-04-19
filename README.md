@@ -68,6 +68,49 @@ Users curate knowledge in **Obsidian**. Agents propose, humans approve.
 | Testing | `pytest` |
 | Type checking | `pyright` |
 
+## Getting Started
+
+**1. Clone and install:**
+```bash
+git clone git@github.com:inotives/agent-knowledge.git
+cd agent-knowledge
+uv sync
+```
+
+**2. Initialize data directory:**
+```bash
+uv run akw init
+```
+
+**3. Add MCP server to your agent (e.g. Claude Code):**
+
+Add to `~/.claude/settings.json` or project `.mcp.json`:
+```json
+{
+  "mcpServers": {
+    "agent-knowledge": {
+      "command": "uv",
+      "args": ["--directory", "/absolute/path/to/cloned/agent-knowledge", "run", "agent-knowledge-server"]
+    }
+  }
+}
+```
+Replace `/absolute/path/to/cloned/agent-knowledge` with the actual path where you cloned the repo.
+
+**4. Restart your agent.** The 19 tools + 2 prompts will be available.
+
+## CLI Commands
+
+| Command | Description |
+|---|---|
+| `akw init` | Initialize data directory and run migrations |
+| `akw status` | Show system stats |
+| `akw sessions` | List recent sessions |
+| `akw search "query"` | Search knowledge from terminal |
+| `akw review` | Run LLM-powered daily review (requires `ANTHROPIC_API_KEY`) |
+| `akw reindex` | Rebuild search index |
+| `akw purge` | Delete old reviewed sessions |
+
 ## Documentation
 
 - [Project Specification](docs/SPECS.md) — full design, data model, tools, and workflows
