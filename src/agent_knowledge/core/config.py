@@ -52,15 +52,17 @@ def load_config(pyproject_path: Path | None = None) -> Config:
         return Config()
 
     llm_data = section.get("llm", {})
+    llm_defaults = LLMConfig()
     llm = LLMConfig(
-        provider=llm_data.get("provider", LLMConfig.provider),
-        model=llm_data.get("model", LLMConfig.model),
+        provider=llm_data.get("provider", llm_defaults.provider),
+        model=llm_data.get("model", llm_defaults.model),
     )
 
-    data_dir = section.get("data_dir", str(Config.data_dir))
+    defaults = Config()
+    data_dir = section.get("data_dir", str(defaults.data_dir))
     return Config(
         data_dir=Path(data_dir).expanduser(),
-        search_engine=section.get("search_engine", Config.search_engine),
+        search_engine=section.get("search_engine", defaults.search_engine),
         llm=llm,
     )
 
