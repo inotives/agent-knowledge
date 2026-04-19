@@ -163,7 +163,7 @@ Knowledge that hasn't been converted into skills and workflows is just reference
 ~/.agent-knowledge/          # Default data root (configurable)
 ├── db/
 │   ├── sessions.db                # SQLite — sessions, turns, edits
-│   └── search.db                  # DuckDB — search index
+│   └── search.db                  # DuckDB — search index (synced on startup)
 └── memory/                        # All markdown tiers (open as Obsidian vault)
     ├── drafts/                    # Tier 1: draft pages pending curation
     │   ├── sessions/              # Session drafts (auto, per session end)
