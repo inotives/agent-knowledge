@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+
+# Environment & Secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Runtime data (never commit session data or memory content)
+*.db
+*.db-shm
+*.db-wal
+*.duckdb
+*.duckdb.wal
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
