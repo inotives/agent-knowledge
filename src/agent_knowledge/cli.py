@@ -164,6 +164,247 @@ def search_cmd(query: str, tier: str | None):
     duckdb_conn.close()
 
 
+@main.command()
+def review():
+    """Run daily review — synthesize pending session drafts into knowledge drafts using LLM."""
+    import os
+    from agent_knowledge.core.config import load_config
+
+    config = load_config()
+    if not config.sessions_db.exists():
+        click.echo("Not initialized. Run 'akw init' first.")
+        return
+
+    conn = storage.connect(config.sessions_db)
+
+    # Gather pending items
+    orphans = storage.get_sessions_needing_drafts(conn)
+    unreviewed = storage.get_unreviewed_sessions(conn, exclude_today=False)
+
+    if not orphans and not unreviewed:
+        click.echo("No pending sessions to review.")
+        conn.close()
+        return
+
+    # Check API key
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        click.echo("ANTHROPIC_API_KEY not set. Export it or set in .env file.", err=True)
+        conn.close()
+        return
+
+    import anthropic
+    client = anthropic.Anthropic(api_key=api_key)
+
+    # Collect all session content for review
+    session_contents = []
+    session_ids = []
+
+    for session in orphans:
+        turns = storage.get_turns(conn, session["id"])
+        if turns:
+            turn_text = "\n".join(f"- Request: {t['request']}\n  Response: {t['response']}" for t in turns)
+            session_contents.append(f"## Session: {session['agent']} ({session['type']}) — {session['started_at'][:10]}\n{turn_text}")
+            session_ids.append(session["id"])
+
+    for session in unreviewed:
+        draft_path = storage.get_session_draft_path(conn, session["id"])
+        if draft_path:
+            try:
+                content = memory.read_page(config.memory_dir, draft_path)
+                session_contents.append(f"## Session Draft: {session['agent']} ({session['type']}) — {session['started_at'][:10]}\n{content}")
+                session_ids.append(session["id"])
+            except FileNotFoundError:
+                turns = storage.get_turns(conn, session["id"])
+                if turns:
+                    turn_text = "\n".join(f"- Request: {t['request']}\n  Response: {t['response']}" for t in turns)
+                    session_contents.append(f"## Session: {session['agent']} ({session['type']}) — {session['started_at'][:10]}\n{turn_text}")
+                    session_ids.append(session["id"])
+
+    if not session_contents:
+        click.echo("No session content to review.")
+        conn.close()
+        return
+
+    click.echo(f"Reviewing {len(session_contents)} sessions...")
+
+    # Call LLM
+    all_content = "\n\n".join(session_contents)
+    prompt = f"""You are reviewing AI agent session logs to extract reusable knowledge.
+
+Analyze the following session data and:
+1. Identify key decisions, patterns, and learnings
+2. Detect cross-session patterns if multiple sessions exist
+3. Write knowledge draft pages in markdown format
+
+For each knowledge draft, output it in this format:
+---DRAFT---
+title: <title>
+tags: <comma-separated tags>
+summary: <one-line summary>
+---
+<markdown content>
+---END---
+
+Focus on actionable, reusable knowledge. Skip trivial or one-off details.
+
+Session data:
+{all_content}"""
+
+    try:
+        response = client.messages.create(
+            model=config.llm.model,
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        llm_output = response.content[0].text
+    except Exception as e:
+        click.echo(f"LLM error: {e}", err=True)
+        conn.close()
+        return
+
+    # Parse drafts from LLM output
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    drafts_written = 0
+
+    parts = llm_output.split("---DRAFT---")
+    for part in parts[1:]:  # Skip text before first draft
+        if "---END---" not in part:
+            continue
+        draft_content = part.split("---END---")[0].strip()
+
+        # Parse header
+        lines = draft_content.split("\n")
+        title = "Untitled"
+        tags_str = ""
+        summary_line = ""
+        content_start = 0
+
+        for i, line in enumerate(lines):
+            if line.startswith("title:"):
+                title = line.split(":", 1)[1].strip()
+            elif line.startswith("tags:"):
+                tags_str = line.split(":", 1)[1].strip()
+            elif line.startswith("summary:"):
+                summary_line = line.split(":", 1)[1].strip()
+            elif line == "---":
+                content_start = i + 1
+                break
+
+        md_content = "\n".join(lines[content_start:]).strip()
+        if not md_content:
+            continue
+
+        # Write draft
+        slug = title.lower().replace(" ", "-")[:50]
+        draft_path = f"drafts/knowledge/{today}-{slug}.md"
+        tags = [t.strip() for t in tags_str.split(",") if t.strip()]
+
+        try:
+            from agent_knowledge.core import sanitizer
+            md_content, _ = sanitizer.redact(md_content)
+
+            page_content = ""
+            if tags or summary_line:
+                page_content += "---\n"
+                if tags:
+                    page_content += f"tags: {tags}\n"
+                if summary_line:
+                    page_content += f"summary: {summary_line}\n"
+                page_content += "---\n\n"
+            page_content += f"# {title}\n\n{md_content}"
+
+            memory.create_page(config.memory_dir, draft_path, page_content)
+            storage.create_memory_edit(conn, draft_path, "draft", "create", summary_line or f"Review draft: {title}")
+            click.echo(f"  Draft: {draft_path}")
+            drafts_written += 1
+        except FileExistsError:
+            click.echo(f"  Skipped (exists): {draft_path}")
+
+    # Write review report
+    report_path = f"drafts/reviews/{today}.md"
+    report = f"# Daily Review — {today}\n\nSessions reviewed: {len(session_ids)}\nDrafts generated: {drafts_written}\n\n{llm_output}"
+    try:
+        memory.create_page(config.memory_dir, report_path, report)
+        click.echo(f"  Report: {report_path}")
+    except FileExistsError:
+        click.echo(f"  Report exists: {report_path}")
+
+    # Mark sessions as reviewed and clean up session drafts
+    for sid in session_ids:
+        storage.set_session_reviewed(conn, sid)
+        draft_path = storage.get_session_draft_path(conn, sid)
+        if draft_path:
+            try:
+                memory.delete_page(config.memory_dir, draft_path)
+            except FileNotFoundError:
+                pass
+
+    click.echo(f"\nReview complete: {len(session_ids)} sessions reviewed, {drafts_written} drafts written.")
+    conn.close()
+
+
+@main.command()
+@click.option("--older-than", default=365, help="Purge sessions older than N days (default: 365).")
+def purge(older_than: int):
+    """Delete reviewed sessions and turns older than retention period."""
+    config = load_config()
+    if not config.sessions_db.exists():
+        click.echo("Not initialized. Run 'akw init' first.")
+        return
+
+    conn = storage.connect(config.sessions_db)
+
+    from datetime import datetime, timezone, timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    all_sessions = storage.list_sessions(conn)
+    to_purge = [
+        s for s in all_sessions
+        if s["reviewed_at"] is not None and s["started_at"] < cutoff
+    ]
+
+    if not to_purge:
+        click.echo(f"No reviewed sessions older than {older_than} days to purge.")
+        conn.close()
+        return
+
+    purged_turns = 0
+    for session in to_purge:
+        turns = storage.get_turns(conn, session["id"])
+        purged_turns += len(turns)
+
+        draft_path = storage.get_session_draft_path(conn, session["id"])
+        if draft_path:
+            try:
+                memory.delete_page(config.memory_dir, draft_path)
+            except FileNotFoundError:
+                pass
+
+        conn.execute("DELETE FROM turns WHERE session_id = ?", (session["id"],))
+        conn.execute("DELETE FROM memory_edits WHERE session_id = ?", (session["id"],))
+        conn.execute("DELETE FROM sessions WHERE id = ?", (session["id"],))
+
+    conn.commit()
+    click.echo(f"Purged {len(to_purge)} sessions, {purged_turns} turns (older than {older_than} days).")
+    conn.close()
+
+
+@main.command()
+def reindex():
+    """Rebuild DuckDB search index from /memory/knowledge and /memory/skills."""
+    config = load_config()
+    if not config.memory_dir.exists():
+        click.echo("Not initialized. Run 'akw init' first.")
+        return
+
+    duckdb_conn = search.connect(config.search_db)
+    count = search.sync_from_files(duckdb_conn, config.memory_dir)
+    click.echo(f"Indexed {count} pages.")
+    duckdb_conn.close()
+
+
 def _find_migrations_dir() -> Path | None:
     """Find db/migrations/ relative to the package or cwd."""
     candidates = [
