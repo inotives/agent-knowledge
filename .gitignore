@@ -8,16 +8,20 @@ build/
 
 # Environment & Secrets
 .env
-.env.*
+.env.local
 *.pem
 *.key
+!.env.template
 
 # Runtime data (never commit session data or memory content)
-*.db
-*.db-shm
-*.db-wal
-*.duckdb
-*.duckdb.wal
+db/*.db
+db/*.db-shm
+db/*.db-wal
+db/*.duckdb
+db/*.duckdb.wal
+
+# dbmate auto-generated schema dump
+db/schema.sql
 
 # IDE
 .idea/
