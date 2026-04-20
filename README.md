@@ -70,34 +70,69 @@ Users curate knowledge in **Obsidian**. Agents propose, humans approve.
 
 ## Getting Started
 
-**1. Clone and install:**
+**Prerequisites:** Python 3.12+ and [uv](https://docs.astral.sh/uv/getting-started/installation/)
+
 ```bash
 git clone git@github.com:inotives/agent-knowledge.git
 cd agent-knowledge
-uv sync
 ```
 
-**2. Initialize data directory:**
+### Option A — Local Install (recommended)
+
+Install as global commands. Works from anywhere, no path needed.
+
 ```bash
+uv tool install --from . agent-knowledge
+akw init
+```
+
+Add MCP server to Claude Code:
+```bash
+claude mcp add agent-knowledge agent-knowledge-server
+```
+Or manually add to `~/.claude/settings.json`:
+```json
+{
+  "mcpServers": {
+    "agent-knowledge": {
+      "command": "agent-knowledge-server"
+    }
+  }
+}
+```
+
+**Updating to latest:**
+```bash
+cd agent-knowledge
+git pull
+uv tool install --from . agent-knowledge --force
+```
+
+### Option B — Development Setup
+
+Run from the project directory with `uv run`. Use this when developing or contributing.
+
+```bash
+uv sync
 uv run akw init
 ```
 
-**3. Add MCP server to your agent (e.g. Claude Code):**
-
-Add to `~/.claude/settings.json` or project `.mcp.json`:
+Add MCP server to project-level `.mcp.json` in the repo root:
 ```json
 {
   "mcpServers": {
     "agent-knowledge": {
       "command": "uv",
-      "args": ["--directory", "/absolute/path/to/cloned/agent-knowledge", "run", "agent-knowledge-server"]
+      "args": ["run", "agent-knowledge-server"]
     }
   }
 }
 ```
-Replace `/absolute/path/to/cloned/agent-knowledge` with the actual path where you cloned the repo.
+This only activates when working in this project directory.
 
-**4. Restart your agent.** The 19 tools + 2 prompts will be available.
+### Verify
+
+Restart your agent. The 19 tools + 2 prompts will be available.
 
 ## CLI Commands
 
