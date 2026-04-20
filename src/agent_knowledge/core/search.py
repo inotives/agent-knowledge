@@ -10,9 +10,12 @@ import duckdb
 
 
 def connect(db_path: Path) -> duckdb.DuckDBPyConnection:
-    """Open a persistent DuckDB connection and ensure schema exists."""
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = duckdb.connect(str(db_path))
+    """Open an in-memory DuckDB connection and ensure schema exists.
+
+    Uses in-memory storage since the index is always rebuilt from files on
+    startup. This avoids exclusive file locks that prevent concurrent sessions.
+    """
+    conn = duckdb.connect(":memory:")
     conn.execute("INSTALL fts")
     conn.execute("LOAD fts")
     _ensure_schema(conn)
