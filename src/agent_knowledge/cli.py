@@ -37,15 +37,16 @@ def init():
     if migrations_dir is None:
         click.echo("Warning: db/migrations/ not found, skipping migrations.", err=True)
     else:
+        dbmate_bin = _find_dbmate()
         db_url = f"sqlite:{config.sessions_db}"
         try:
             subprocess.run(
-                ["dbmate", "--url", db_url, "--migrations-dir", str(migrations_dir), "--no-dump-schema", "up"],
+                [dbmate_bin, "--url", db_url, "--migrations-dir", str(migrations_dir), "--no-dump-schema", "up"],
                 check=True,
             )
             click.echo(f"Database: {config.sessions_db}")
         except FileNotFoundError:
-            click.echo("Warning: dbmate not found. Run 'uv sync' to install dev dependencies.", err=True)
+            click.echo("Warning: dbmate not found.", err=True)
         except subprocess.CalledProcessError as e:
             click.echo(f"Migration error: {e}", err=True)
             sys.exit(1)
@@ -403,6 +404,20 @@ def reindex():
     count = search.sync_from_files(duckdb_conn, config.memory_dir)
     click.echo(f"Indexed {count} pages.")
     duckdb_conn.close()
+
+
+def _find_dbmate() -> str:
+    """Find the dbmate binary — check PATH, then look next to this Python executable."""
+    import shutil
+    found = shutil.which("dbmate")
+    if found:
+        return found
+    # When installed via uv tool, dbmate is next to the Python binary
+    bin_dir = Path(sys.executable).parent
+    candidate = bin_dir / "dbmate"
+    if candidate.exists():
+        return str(candidate)
+    return "dbmate"
 
 
 def _find_migrations_dir() -> Path | None:

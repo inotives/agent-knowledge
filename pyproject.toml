@@ -9,6 +9,7 @@ dependencies = [
     "duckdb",
     "click",
     "anthropic",
+    "dbmate-bin>=2.31",
 ]
 
 [project.scripts]
@@ -24,7 +25,6 @@ packages = ["src/agent_knowledge"]
 
 [tool.uv]
 dev-dependencies = [
-    "dbmate-bin>=2.31",
     "pytest",
     "pyright",
 ]

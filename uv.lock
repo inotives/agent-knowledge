@@ -9,13 +9,13 @@ source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
     { name = "click" },
+    { name = "dbmate-bin" },
     { name = "duckdb" },
     { name = "mcp" },
 ]
 
 [package.dev-dependencies]
 dev = [
-    { name = "dbmate-bin" },
     { name = "pyright" },
     { name = "pytest" },
 ]
@@ -24,13 +24,13 @@ dev = [
 requires-dist = [
     { name = "anthropic" },
     { name = "click" },
+    { name = "dbmate-bin", specifier = ">=2.31" },
     { name = "duckdb" },
     { name = "mcp" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "dbmate-bin", specifier = ">=2.31" },
     { name = "pyright" },
     { name = "pytest" },
 ]
