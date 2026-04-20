@@ -7,11 +7,14 @@ name = "agent-knowledge"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "anthropic" },
     { name = "click" },
-    { name = "dbmate-bin" },
     { name = "duckdb" },
     { name = "mcp" },
+]
+
+[package.optional-dependencies]
+llm = [
+    { name = "anthropic" },
 ]
 
 [package.dev-dependencies]
@@ -22,12 +25,12 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "anthropic" },
+    { name = "anthropic", marker = "extra == 'llm'" },
     { name = "click" },
-    { name = "dbmate-bin", specifier = ">=2.31" },
     { name = "duckdb" },
     { name = "mcp" },
 ]
+provides-extras = ["llm"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -223,17 +226,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/41/52/a8908dcb1a389a459a29008c29966c1d552588d4ae6d43f3a1a4512e0ebe/cryptography-46.0.7-cp38-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:a1529d614f44b863a7b480c6d000fe93b59acee9c82ffa027cfadc77521a9f5e", size = 4664256, upload-time = "2026-04-08T01:57:33.144Z" },
     { url = "https://files.pythonhosted.org/packages/4b/fa/f0ab06238e899cc3fb332623f337a7364f36f4bb3f2534c2bb95a35b132c/cryptography-46.0.7-cp38-abi3-win32.whl", hash = "sha256:f247c8c1a1fb45e12586afbb436ef21ff1e80670b2861a90353d9b025583d246", size = 3013001, upload-time = "2026-04-08T01:57:34.933Z" },
     { url = "https://files.pythonhosted.org/packages/d2/f1/00ce3bde3ca542d1acd8f8cfa38e446840945aa6363f9b74746394b14127/cryptography-46.0.7-cp38-abi3-win_amd64.whl", hash = "sha256:506c4ff91eff4f82bdac7633318a526b1d1309fc07ca76a3ad182cb5b686d6d3", size = 3472985, upload-time = "2026-04-08T01:57:36.714Z" },
-]
-
-[[package]]
-name = "dbmate-bin"
-version = "2.32.0"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/15/79/f026b5aa0d07fba7a06f1b267d3f57816aa2e013d78a6918be8ad0ef7c36/dbmate_bin-2.32.0-py3-none-macosx_10_9_x86_64.whl", hash = "sha256:5d6cc8b5b5504c3c6c1ffb05d5216466d64525f890e91e8ff19bb34bed04f64d", size = 11727896, upload-time = "2026-03-30T16:15:58.878Z" },
-    { url = "https://files.pythonhosted.org/packages/2c/c3/4acf09baa8d5f6412e17c2465eb2e37d50d1a0945fdedc06c81de05d7270/dbmate_bin-2.32.0-py3-none-macosx_11_0_arm64.whl", hash = "sha256:ab2c05542a54c8dd970dfe6144ab1e3ac7a8be3226ac01368edffd6ec2a8e38b", size = 10831510, upload-time = "2026-03-30T16:16:01.594Z" },
-    { url = "https://files.pythonhosted.org/packages/6f/4a/c1696bbdf57367b951b0f6bd222fe608aa40672b44a43c621780773c4c86/dbmate_bin-2.32.0-py3-none-manylinux2014_aarch64.musllinux_1_1_aarch64.whl", hash = "sha256:93d00d8f792d2e9f22bdbb6c55284df80e47228f9a6d38808124e59800320a39", size = 10859385, upload-time = "2026-03-30T16:16:03.607Z" },
-    { url = "https://files.pythonhosted.org/packages/9f/25/32dd1368598c7fb2042a3960e080750df1e48ae521b412349599a01bf9b6/dbmate_bin-2.32.0-py3-none-manylinux2014_x86_64.musllinux_1_1_x86_64.whl", hash = "sha256:4d599014ca5a9ba69b5e5be7928672396cc560b19332a9fa512a27b4ede5171c", size = 12018485, upload-time = "2026-03-30T16:16:06.061Z" },
 ]
 
 [[package]]

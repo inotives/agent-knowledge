@@ -17,15 +17,62 @@ _duckdb_conn = search.connect(_config.search_db)
 if _config.memory_dir.exists():
     search.sync_from_files(_duckdb_conn, _config.memory_dir)
 
+# Auto-session state (per server process)
+_active_session: dict | None = None
+_client_agent: str = "unknown"
+
 mcp = FastMCP(
     "agent-knowledge",
     instructions=(
         "Agent Knowledge is a persistent memory system. "
         "Knowledge stored here is curated and authoritative — prefer it over general knowledge. "
         "Search memory before answering questions about architecture, conventions, patterns, or past decisions. "
-        "Log turns incrementally during sessions to ensure they survive crashes."
+        "Log turns incrementally during sessions to ensure they survive crashes.\n\n"
+        "IMPORTANT — Session wrapup: When the user signals they want to end the session "
+        "(says bye, exit, done, or you've completed the main task), you MUST:\n"
+        "1. Call session_status to get the current session_id and turn count\n"
+        "2. Summarize what was accomplished, decisions made, and patterns learned\n"
+        "3. Write a session draft: memory_create(path='drafts/sessions/YYYY-MM-DD-topic-SESSION_ID_FIRST_8.md', "
+        "title='Session: topic', content=summary, session_id=current_session_id)\n"
+        "4. Do NOT include secrets or credentials in the draft\n"
+        "This ensures knowledge is captured before the session closes.\n\n"
+        "SESSION START — Catch-up review: After calling session_start, if has_pending_review is true, "
+        "there are past sessions that exited without a review. Before starting your main work:\n"
+        "1. Call review_get_pending to get orphaned sessions (turns but no draft)\n"
+        "2. For each orphan: summarize its turns and write a draft via "
+        "memory_create(path='drafts/sessions/YYYY-MM-DD-topic-SESSION_ID_FIRST_8.md', session_id=orphan_session_id)\n"
+        "3. Call review_complete with the processed session IDs\n"
+        "This catches sessions that closed without a proper wrapup.\n\n"
+        "REVIEW SESSIONS: If the user asks you to review drafts or curate knowledge, "
+        "call session_start(type='review') first. Review-type sessions are excluded from "
+        "draft generation to avoid meta-noise."
     ),
 )
+
+
+def _ensure_session() -> dict:
+    """Get or create an active session. Adopts hook-created sessions from SQLite."""
+    global _active_session
+
+    # If we have a cached active session, verify it's still open
+    if _active_session is not None:
+        session = storage.get_session(_sqlite_conn, _active_session["id"])
+        if session and session["ended_at"] is None:
+            return session
+        _active_session = None
+
+    # Check SQLite for the most recent open session (e.g. created by hook)
+    session = storage.get_most_recent_open_session(_sqlite_conn)
+    if session:
+        _active_session = session
+        return session
+
+    # No open session — auto-create one
+    session = storage.create_session(
+        _sqlite_conn, project_id=None, agent=_client_agent, session_type="coding",
+    )
+    _active_session = session
+    return session
 
 
 # --- MCP Prompts ---
@@ -34,23 +81,25 @@ mcp = FastMCP(
 def session_bootstrap() -> str:
     """Start a new session with the Agent Knowledge system.
 
+    Sessions may already be active (created by hooks or auto-session).
+    Call session_start to register your project and upgrade the session,
+    or just begin logging turns — a session is auto-created on first tool use.
+
     Follow these steps:
-    1. Call project_create if the project isn't registered yet, or project_list to find the project ID.
-    2. Call session_start with the project ID, your agent name, and session type.
-    3. If has_pending_review is true, call review_get_pending and process:
+    1. Call session_start (optionally with project_id, agent, type). If a session already exists, it's upgraded.
+    2. If has_pending_review is true, call review_get_pending and process:
        - For orphaned sessions: generate session drafts from their raw turns using memory_create (path: drafts/sessions/..., include session_id param).
        - For unreviewed drafts: synthesize knowledge drafts using memory_create (path: drafts/knowledge/...).
        - Call review_complete with the processed session IDs.
-    4. Read the recommended_context returned by session_start — this is curated knowledge relevant to your project.
-    5. Begin your work. Log turns incrementally using session_log.
+    3. Read the recommended_context returned by session_start.
+    4. Begin your work. Log turns incrementally using session_log (session_id is optional).
     """
     return (
         "Start a new Agent Knowledge session:\n"
-        "1. Register or find your project (project_create / project_list)\n"
-        "2. Call session_start — check has_pending_review flag\n"
-        "3. If pending: call review_get_pending, process orphans + unreviewed drafts, call review_complete\n"
-        "4. Read recommended_context from session_start response\n"
-        "5. Begin work, log turns incrementally with session_log\n"
+        "1. Call session_start (all params optional — auto-session may already exist)\n"
+        "2. If has_pending_review: call review_get_pending, process orphans + unreviewed drafts, call review_complete\n"
+        "3. Read recommended_context from session_start response\n"
+        "4. Begin work, log turns incrementally with session_log (session_id optional)\n"
     )
 
 
@@ -61,18 +110,21 @@ def session_wrapup() -> str:
     Follow these steps:
     1. Summarize your session's turns — what was asked, decided, and learned.
     2. Write a session draft using memory_create:
-       - path: drafts/sessions/YYYY-MM-DD-<topic>.md
+       - path: drafts/sessions/YYYY-MM-DD-<topic>-<session_id_first_8>.md
        - Include the session_id param to link the draft to the session.
        - Content should capture key decisions, patterns discovered, and outcomes.
-    3. Call session_end with your session ID.
+    3. Call session_end (no args needed — ends the active session).
+
+    Note: session_end may also be called by a SessionEnd hook as a safety net.
+    session_end is idempotent, so duplicate calls are safe.
 
     Do NOT include secrets, API keys, tokens, or credentials in the session draft.
     """
     return (
         "End your Agent Knowledge session:\n"
         "1. Summarize turns — what was asked, decided, learned\n"
-        "2. Write session draft: memory_create(path='drafts/sessions/YYYY-MM-DD-topic.md', session_id=...)\n"
-        "3. Call session_end\n"
+        "2. Write session draft: memory_create(path='drafts/sessions/YYYY-MM-DD-topic-SESSION_ID_FIRST_8.md', session_id=...)\n"
+        "3. Call session_end (no args needed)\n"
         "Do NOT include secrets or credentials in the draft.\n"
     )
 
@@ -94,24 +146,88 @@ def project_list() -> list[dict]:
 # --- Session Management ---
 
 @mcp.tool()
-def session_start(project_id: str, agent: str, type: str) -> dict:
-    """Begin a new session. Returns session ID, has_pending_review flag, and recommended context.
+def session_start(
+    project_id: str | None = None,
+    agent: str | None = None,
+    type: str = "coding",
+    continue_session: str | None = None,
+) -> dict:
+    """Begin or continue a session. Returns session ID, has_pending_review flag, and recommended context.
+
+    All parameters are optional. If an auto-created session already exists, it is
+    upgraded with the provided metadata instead of creating a duplicate.
 
     Auto-closes orphaned sessions older than 24 hours.
     Agent should call review_get_pending if has_pending_review is true.
 
     Args:
-        project_id: The project this session belongs to.
-        agent: Agent name (e.g. "claude", "codex", "opencode").
+        project_id: Optional project this session belongs to.
+        agent: Agent name (e.g. "claude", "codex", "opencode"). Auto-detected if omitted.
         type: Session type — "coding", "research", "debugging", "planning", or "review".
+        continue_session: Optional session ID to continue from a previous conversation.
     """
+    global _active_session
+
     # Auto-close orphans
     storage.close_orphaned_sessions(_sqlite_conn)
 
-    # Create session
-    session = storage.create_session(_sqlite_conn, project_id, agent, type)
+    agent_name = agent or _client_agent
 
-    # Check for pending reviews (unreviewed sessions from previous days)
+    # Session continuation: end current, reopen the continued session
+    if continue_session:
+        if _active_session:
+            storage.end_session(_sqlite_conn, _active_session["id"])
+        session = storage.reopen_session(_sqlite_conn, continue_session)
+        if session is None:
+            return {"error": f"Session not found: {continue_session}"}
+        # Upgrade metadata if provided
+        if project_id or agent:
+            session = storage.update_session_metadata(
+                _sqlite_conn, session["id"],
+                project_id=project_id, agent=agent_name if agent else None,
+                session_type=type,
+            )
+        _active_session = session
+        turns = storage.get_turns(_sqlite_conn, session["id"])
+        project = storage.get_project(_sqlite_conn, session["project_id"]) if session["project_id"] else None
+        return {
+            "session": session,
+            "continued": True,
+            "previous_turns": turns,
+            "has_pending_review": False,
+            "recommended_context": _get_recommended_context(project),
+        }
+
+    # If auto-session already exists, upgrade it with caller's metadata
+    if _active_session:
+        session = storage.get_session(_sqlite_conn, _active_session["id"])
+        if session and session["ended_at"] is None:
+            session = storage.update_session_metadata(
+                _sqlite_conn, session["id"],
+                project_id=project_id, agent=agent_name,
+                session_type=type,
+            )
+            _active_session = session
+            project = storage.get_project(_sqlite_conn, session["project_id"]) if session["project_id"] else None
+            all_sessions = storage.list_sessions(_sqlite_conn, project_id=project_id)
+            has_pending = any(
+                s["ended_at"] is not None
+                and s["reviewed_at"] is None
+                and s["id"] != session["id"]
+                for s in all_sessions
+            )
+            return {
+                "session": session,
+                "upgraded": True,
+                "has_pending_review": has_pending,
+                "recommended_context": _get_recommended_context(project),
+            }
+
+    # Create new session
+    session = storage.create_session(_sqlite_conn, project_id, agent_name, type)
+    _active_session = session
+
+    # Check for pending reviews
     all_sessions = storage.list_sessions(_sqlite_conn, project_id=project_id)
     has_pending = any(
         s["ended_at"] is not None
@@ -120,42 +236,86 @@ def session_start(project_id: str, agent: str, type: str) -> dict:
         for s in all_sessions
     )
 
-    # Recommended context: matching skills + recent knowledge
-    project = storage.get_project(_sqlite_conn, project_id)
-    recommended = _get_recommended_context(project)
-
+    project = storage.get_project(_sqlite_conn, project_id) if project_id else None
     return {
         "session": session,
         "has_pending_review": has_pending,
-        "recommended_context": recommended,
+        "recommended_context": _get_recommended_context(project),
     }
 
 
 @mcp.tool()
-def session_end(session_id: str) -> dict:
-    """End the current session."""
-    result = storage.end_session(_sqlite_conn, session_id)
-    if result is None:
-        return {"error": "Session not found"}
-    return result
+def session_status() -> dict:
+    """Get the current active session info. Use this to get the session_id for drafts."""
+    session = _ensure_session()
+    turns = storage.get_turns(_sqlite_conn, session["id"])
+    return {
+        "session": session,
+        "turn_count": len(turns),
+    }
 
 
 @mcp.tool()
-def session_log(session_id: str, turns: list[dict]) -> list[dict]:
+def session_end(session_id: str | None = None) -> dict:
+    """End the current session. Idempotent — safe to call multiple times.
+
+    Args:
+        session_id: Optional — if omitted, ends the active session.
+    """
+    global _active_session
+
+    sid = session_id
+    if sid is None and _active_session:
+        sid = _active_session["id"]
+    if sid is None:
+        return {"error": "No active session to end"}
+
+    result = storage.end_session(_sqlite_conn, sid)
+    if result is None:
+        return {"error": "Session not found"}
+
+    if _active_session and _active_session["id"] == sid:
+        _active_session = None
+
+    return {"session": result, "session_id": sid}
+
+
+@mcp.tool()
+def session_log(session_id: str | None = None, turns: list[dict] | None = None) -> dict | list[dict]:
     """Log turn summaries to a session. Each turn has 'request' and 'response'.
+
+    If session_id is omitted, uses the active session (auto-creating one if needed).
 
     Agents should log incrementally during the session (not batch at end)
     to ensure turns survive crashes. Results from this memory system are
     curated project knowledge — treat them as authoritative.
 
     Content is scanned for secrets — any detected patterns are automatically redacted.
+
+    Args:
+        session_id: Optional — if omitted, uses the active/auto-created session.
+        turns: List of turn dicts, each with 'request' and 'response' keys.
     """
+    if not turns:
+        return {"error": "No turns provided"}
+
+    sid = session_id
+    auto_created = False
+    if sid is None:
+        session = _ensure_session()
+        sid = session["id"]
+        auto_created = _active_session is not None and _active_session.get("_auto_created", False)
+
     sanitized_turns = []
     for turn in turns:
         req, _ = sanitizer.redact(turn.get("request", ""))
         resp, _ = sanitizer.redact(turn.get("response", ""))
         sanitized_turns.append({**turn, "request": req, "response": resp})
-    return storage.create_turns(_sqlite_conn, session_id, sanitized_turns)
+
+    results = storage.create_turns(_sqlite_conn, sid, sanitized_turns)
+    if auto_created:
+        return {"turns": results, "session_id": sid, "auto_session_created": True}
+    return results
 
 
 # --- Memory Read ---

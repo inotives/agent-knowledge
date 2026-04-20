@@ -1,8 +1,5 @@
 """Shared test fixtures."""
 
-import subprocess
-from pathlib import Path
-
 import pytest
 
 from agent_knowledge.core import storage, search
@@ -10,13 +7,8 @@ from agent_knowledge.core import storage, search
 
 @pytest.fixture
 def tmp_db(tmp_path):
-    """Create a temporary SQLite database with migrations applied."""
+    """Create a temporary SQLite database with auto-migration."""
     db_path = tmp_path / "sessions.db"
-    migrations_dir = Path(__file__).parent.parent / "db" / "migrations"
-    subprocess.run(
-        ["dbmate", "--url", f"sqlite:{db_path}", "--migrations-dir", str(migrations_dir), "--no-dump-schema", "up"],
-        check=True,
-    )
     conn = storage.connect(db_path)
     yield conn
     conn.close()

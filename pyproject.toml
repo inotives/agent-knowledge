@@ -8,9 +8,10 @@ dependencies = [
     "mcp",
     "duckdb",
     "click",
-    "anthropic",
-    "dbmate-bin>=2.31",
 ]
+
+[project.optional-dependencies]
+llm = ["anthropic"]
 
 [project.scripts]
 akw = "agent_knowledge.cli:main"
