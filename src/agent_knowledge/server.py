@@ -41,8 +41,13 @@ mcp = FastMCP(
         "1. Call review_get_pending to get orphaned sessions (turns but no draft)\n"
         "2. For each orphan: summarize its turns and write a draft via "
         "memory_create(path='drafts/sessions/YYYY-MM-DD-topic-SESSION_ID_FIRST_8.md', session_id=orphan_session_id)\n"
-        "3. Call review_complete with the processed session IDs\n"
+        "3. Do NOT call review_complete — that is a CLI-only operation (akw review). "
+        "Drafts persist until the human reviews and promotes them.\n"
         "This catches sessions that closed without a proper wrapup.\n\n"
+        "DRAFT POLICY: Agents can only CREATE and APPEND to drafts. "
+        "Agents must NEVER delete drafts — deletion and review completion are human-only "
+        "operations performed via the CLI (akw review). "
+        "Do not use memory_delete on any path under drafts/.\n\n"
         "REVIEW SESSIONS: If the user asks you to review drafts or curate knowledge, "
         "call session_start(type='review') first. Review-type sessions are excluded from "
         "draft generation to avoid meta-noise."
@@ -90,14 +95,14 @@ def session_bootstrap() -> str:
     2. If has_pending_review is true, call review_get_pending and process:
        - For orphaned sessions: generate session drafts from their raw turns using memory_create (path: drafts/sessions/..., include session_id param).
        - For unreviewed drafts: synthesize knowledge drafts using memory_create (path: drafts/knowledge/...).
-       - Call review_complete with the processed session IDs.
+       - Drafts persist for the user to review and promote later (review completion is CLI-only).
     3. Read the recommended_context returned by session_start.
     4. Begin your work. Log turns incrementally using session_log (session_id is optional).
     """
     return (
         "Start a new Agent Knowledge session:\n"
         "1. Call session_start (all params optional — auto-session may already exist)\n"
-        "2. If has_pending_review: call review_get_pending, process orphans + unreviewed drafts, call review_complete\n"
+        "2. If has_pending_review: call review_get_pending, create drafts for orphans + unreviewed sessions\n"
         "3. Read recommended_context from session_start response\n"
         "4. Begin work, log turns incrementally with session_log (session_id optional)\n"
     )
@@ -151,6 +156,7 @@ def session_start(
     agent: str | None = None,
     type: str = "coding",
     continue_session: str | None = None,
+    metadata: dict | None = None,
 ) -> dict:
     """Begin or continue a session. Returns session ID, has_pending_review flag, and recommended context.
 
@@ -165,6 +171,7 @@ def session_start(
         agent: Agent name (e.g. "claude", "codex", "opencode"). Auto-detected if omitted.
         type: Session type — "coding", "research", "debugging", "planning", or "review".
         continue_session: Optional session ID to continue from a previous conversation.
+        metadata: Optional dict of extra session context (e.g. working_dir, repo_url, harness_version).
     """
     global _active_session
 
@@ -172,6 +179,20 @@ def session_start(
     storage.close_orphaned_sessions(_sqlite_conn)
 
     agent_name = agent or _client_agent
+
+    # Resolve project name to ID if needed
+    if project_id:
+        project = storage.get_project(_sqlite_conn, project_id)
+        if project is None:
+            # Try matching by name
+            for p in storage.list_projects(_sqlite_conn):
+                if p["name"] == project_id:
+                    project_id = p["id"]
+                    break
+            else:
+                # Auto-create project with the given name
+                new_project = storage.create_project(_sqlite_conn, project_id, "")
+                project_id = new_project["id"]
 
     # Session continuation: end current, reopen the continued session
     if continue_session:
@@ -224,7 +245,7 @@ def session_start(
             }
 
     # Create new session
-    session = storage.create_session(_sqlite_conn, project_id, agent_name, type)
+    session = storage.create_session(_sqlite_conn, project_id, agent_name, type, metadata=metadata)
     _active_session = session
 
     # Check for pending reviews
@@ -435,10 +456,16 @@ def memory_update(path: str, content: str, summary: str = "") -> dict:
 def memory_delete(path: str, reason: str = "") -> dict:
     """Delete a memory page.
 
+    Drafts (paths under drafts/) cannot be deleted via this tool.
+    Draft cleanup is handled by the CLI (akw review) after human review.
+
     Args:
         path: Page path relative to /memory.
         reason: Why this page is being deleted.
     """
+    if path.startswith("drafts/"):
+        return {"error": "Drafts cannot be deleted by agents. Use the CLI (akw review) for draft cleanup."}
+
     try:
         memory.delete_page(_config.memory_dir, path)
 
@@ -500,25 +527,16 @@ def review_get_pending(project_id: str | None = None) -> dict:
     }
 
 
-@mcp.tool()
-def review_complete(session_ids: list[str]) -> dict:
-    """Mark daily review as done for the given sessions.
-
-    Sets reviewed_at on each session and deletes their session draft files
-    from /memory/drafts/sessions/ (knowledge has been synthesized into knowledge drafts).
-
-    Args:
-        session_ids: List of session IDs that were processed in the review.
-    """
+def _review_complete_internal(conn, config, session_ids: list[str]) -> dict:
+    """Internal: mark sessions reviewed and delete drafts. Used by CLI only."""
     deleted_drafts = []
     for sid in session_ids:
-        storage.set_session_reviewed(_sqlite_conn, sid)
+        storage.set_session_reviewed(conn, sid)
 
-        # Find and delete the session draft file
-        draft_path = storage.get_session_draft_path(_sqlite_conn, sid)
+        draft_path = storage.get_session_draft_path(conn, sid)
         if draft_path:
             try:
-                memory.delete_page(_config.memory_dir, draft_path)
+                memory.delete_page(config.memory_dir, draft_path)
                 deleted_drafts.append(draft_path)
             except FileNotFoundError:
                 pass

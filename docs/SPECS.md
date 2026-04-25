@@ -276,14 +276,15 @@ The server exposes these tools to connected agents:
 |---|---|
 | `memory_create` | Create a new page in any tier. Params: `path`, `title`, `content`, `tags[]`, `summary` |
 | `memory_update` | Update an existing page. Params: `path`, `content`, `summary` (what changed) |
-| `memory_delete` | Delete a page. Params: `path`, `reason` |
+| `memory_delete` | Delete a page. Rejects deletion of drafts (`drafts/` paths) — draft cleanup is CLI-only via `akw review`. Params: `path`, `reason` |
 
 ### Review
 
 | Tool | Description |
 |---|---|
 | `review_get_pending` | Get all items needing review: (1) orphaned sessions — sessions with turns but no session draft (agent can generate drafts from raw turns), (2) unreviewed session drafts from previous days (for daily review synthesis). Returns both types with their data. Params: `project_id` (optional) |
-| `review_complete` | Mark daily review as done. Sets `reviewed_at` on processed sessions, deletes their session draft files from `/memory/drafts/sessions/` (the knowledge has been synthesized into knowledge drafts). Params: `session_ids[]` |
+
+> **Note:** `review_complete` is an internal-only function (not an MCP tool). It is called by the CLI (`akw review`) after human review. Agents cannot complete reviews or delete drafts — they can only create and append to drafts.
 
 ### Promotion
 
