@@ -1,4 +1,4 @@
-"""Tests for SQLite storage module."""
+"""Tests for SQLite storage module — EP-00005 group-based API."""
 
 from agent_knowledge.core import storage
 
@@ -11,6 +11,7 @@ class TestProjects:
         assert project["tags"] == ["python"]
 
         fetched = storage.get_project(tmp_db, project["id"])
+        assert fetched is not None
         assert fetched["id"] == project["id"]
 
     def test_list_projects(self, tmp_db):
@@ -23,76 +24,172 @@ class TestProjects:
         assert storage.get_project(tmp_db, "nonexistent") is None
 
 
-class TestSessions:
-    def test_create_and_end(self, tmp_db):
-        project = storage.create_project(tmp_db, "proj", "/proj")
-        session = storage.create_session(tmp_db, project["id"], "claude", "coding")
-        assert session["agent"] == "claude"
-        assert session["type"] == "coding"
-        assert session["ended_at"] is None
+class TestGroupLifecycle:
+    def test_start_and_end(self, tmp_db):
+        result = storage.start_group(tmp_db, agent="claude", metadata={"project_id": "p1"})
+        assert result["group_id"]
+        assert result["segment_start_at"]
 
-        ended = storage.end_session(tmp_db, session["id"])
-        assert ended["ended_at"] is not None
+        ended = storage.end_group(tmp_db, result["group_id"])
+        assert ended is not None
+        assert ended["segment_end_at"] is not None
+        assert ended["segment_start_at"] == result["segment_start_at"]
 
-    def test_list_by_project(self, tmp_db):
-        p1 = storage.create_project(tmp_db, "p1", "/p1")
-        p2 = storage.create_project(tmp_db, "p2", "/p2")
-        storage.create_session(tmp_db, p1["id"], "claude", "coding")
-        storage.create_session(tmp_db, p2["id"], "codex", "research")
+    def test_end_is_idempotent(self, tmp_db):
+        result = storage.start_group(tmp_db, agent="claude")
+        first = storage.end_group(tmp_db, result["group_id"])
+        second = storage.end_group(tmp_db, result["group_id"])
+        assert first is not None and second is not None
+        assert first["segment_end_at"] == second["segment_end_at"]
 
-        sessions = storage.list_sessions(tmp_db, project_id=p1["id"])
-        assert len(sessions) == 1
-        assert sessions[0]["agent"] == "claude"
+    def test_continuation_reuses_group_id_new_segment(self, tmp_db):
+        # First segment: start, turns, end
+        r1 = storage.start_group(tmp_db, agent="claude")
+        gid = r1["group_id"]
+        storage.create_turns(tmp_db, gid, [{"request": "q", "response": "a"}])
+        storage.end_group(tmp_db, gid)
 
-    def test_reviewed(self, tmp_db):
-        project = storage.create_project(tmp_db, "proj", "/proj")
-        session = storage.create_session(tmp_db, project["id"], "claude", "coding")
-        assert session["reviewed_at"] is None
+        # Continuation
+        r2 = storage.start_group(tmp_db, group_id=gid, agent="claude")
+        assert r2["group_id"] == gid
+        assert r2["segment_start_at"] != r1["segment_start_at"]
 
-        storage.set_session_reviewed(tmp_db, session["id"])
-        updated = storage.get_session(tmp_db, session["id"])
-        assert updated["reviewed_at"] is not None
+        segs = storage.get_group_segments(tmp_db, gid)
+        assert len(segs) == 2
+        assert segs[0]["segment_end_at"] is not None
+        assert segs[1]["segment_end_at"] is None  # second segment still open
+
+    def test_open_groups_excludes_ended(self, tmp_db):
+        r = storage.start_group(tmp_db, agent="claude")
+        assert len(storage.get_open_groups(tmp_db)) == 1
+        storage.end_group(tmp_db, r["group_id"])
+        assert len(storage.get_open_groups(tmp_db)) == 0
 
 
-class TestTurns:
-    def test_create_and_get(self, tmp_db):
-        project = storage.create_project(tmp_db, "proj", "/proj")
-        session = storage.create_session(tmp_db, project["id"], "claude", "coding")
+class TestIdleClose:
+    def test_idle_close_on_stale_via_create_turns(self, tmp_db):
+        r = storage.start_group(tmp_db, agent="claude")
+        gid = r["group_id"]
+        storage.create_turns(tmp_db, gid, [{"request": "old", "response": "old"}])
 
-        turns = storage.create_turns(tmp_db, session["id"], [
-            {"request": "fix the bug", "response": "found null pointer, fixed"},
-            {"request": "add tests", "response": "added 3 test cases"},
+        # Make the segment stale.
+        tmp_db.execute(
+            "UPDATE turns SET created_at = '2026-01-01T00:00:00Z' WHERE group_id = ?",
+            (gid,),
+        )
+        tmp_db.commit()
+
+        result = storage.create_turns(tmp_db, gid, [{"request": "new", "response": "new"}])
+        assert result["idle_closed_segment"] is not None
+        # New segment was opened.
+        segs = storage.get_group_segments(tmp_db, gid)
+        assert len(segs) == 2
+        assert segs[0]["end_kind"] == "idle_close"
+
+    def test_no_idle_close_when_recent(self, tmp_db):
+        r = storage.start_group(tmp_db, agent="claude")
+        result = storage.create_turns(tmp_db, r["group_id"], [{"request": "q", "response": "a"}])
+        assert result["idle_closed_segment"] is None
+
+
+class TestOrphans:
+    def test_orphan_detected_when_old_and_open(self, tmp_db):
+        r = storage.start_group(tmp_db, agent="claude")
+        storage.create_turns(tmp_db, r["group_id"], [{"request": "q", "response": "a"}])
+        tmp_db.execute(
+            "UPDATE turns SET created_at = '2026-01-01T00:00:00Z' WHERE group_id = ?",
+            (r["group_id"],),
+        )
+        tmp_db.commit()
+
+        orphans = storage.get_orphaned_groups(tmp_db, older_than_hours=24)
+        assert len(orphans) == 1
+        assert orphans[0]["group_id"] == r["group_id"]
+
+    def test_recovery_writes_idle_close_then_segment_is_closed_no_draft(self, tmp_db):
+        r = storage.start_group(tmp_db, agent="claude")
+        storage.create_turns(tmp_db, r["group_id"], [{"request": "q", "response": "a"}])
+        tmp_db.execute(
+            "UPDATE turns SET created_at = '2026-01-01T00:00:00Z' WHERE group_id = ?",
+            (r["group_id"],),
+        )
+        tmp_db.commit()
+
+        storage.end_group(tmp_db, r["group_id"], kind="idle_close")
+        assert len(storage.get_orphaned_groups(tmp_db)) == 0
+
+        cnd = storage.get_closed_no_draft_segments(tmp_db)
+        assert len(cnd) == 1
+        assert cnd[0]["end_kind"] == "idle_close"
+
+
+class TestSegmentQueries:
+    def test_get_current_segment_turns(self, tmp_db):
+        r = storage.start_group(tmp_db, agent="claude")
+        storage.create_turns(tmp_db, r["group_id"], [
+            {"request": "q1", "response": "a1"},
+            {"request": "q2", "response": "a2"},
         ])
-        assert len(turns) == 2
+        rows = storage.get_current_segment_turns(tmp_db, r["group_id"])
+        # Includes the start marker + 2 turns
+        assert len(rows) == 3
+        kinds = [row["kind"] for row in rows]
+        assert kinds == ["start", "turn", "turn"]
 
-        fetched = storage.get_turns(tmp_db, session["id"])
-        assert len(fetched) == 2
-        assert fetched[0]["request"] == "fix the bug"
-        assert fetched[1]["request"] == "add tests"
+    def test_get_segment_turns_specific_segment(self, tmp_db):
+        # First segment
+        r1 = storage.start_group(tmp_db, agent="claude")
+        gid = r1["group_id"]
+        storage.create_turns(tmp_db, gid, [{"request": "seg1", "response": "."}])
+        storage.end_group(tmp_db, gid)
+
+        # Second segment
+        r2 = storage.start_group(tmp_db, group_id=gid, agent="claude")
+        storage.create_turns(tmp_db, gid, [{"request": "seg2", "response": "."}])
+
+        seg1_turns = storage.get_segment_turns(tmp_db, gid, r1["segment_start_at"])
+        seg2_turns = storage.get_segment_turns(tmp_db, gid, r2["segment_start_at"])
+
+        seg1_requests = [t["request"] for t in seg1_turns if t["kind"] == "turn"]
+        seg2_requests = [t["request"] for t in seg2_turns if t["kind"] == "turn"]
+        assert seg1_requests == ["seg1"]
+        assert seg2_requests == ["seg2"]
+
+
+class TestListGroups:
+    def test_filter_by_agent(self, tmp_db):
+        storage.start_group(tmp_db, agent="claude", metadata={"agent": "claude"})
+        storage.start_group(tmp_db, agent="codex", metadata={"agent": "codex"})
+
+        claude_only = storage.list_groups(tmp_db, filter_metadata={"agent": "claude"})
+        assert len(claude_only) == 1
+        assert claude_only[0]["metadata"]["agent"] == "claude"
 
 
 class TestMemoryEdits:
-    def test_create_and_history(self, tmp_db):
-        project = storage.create_project(tmp_db, "proj", "/proj")
-        session = storage.create_session(tmp_db, project["id"], "claude", "coding")
+    def test_create_and_history_with_group(self, tmp_db):
+        r = storage.start_group(tmp_db, agent="claude")
+        gid = r["group_id"]
 
         storage.create_memory_edit(
-            tmp_db, "knowledge/concepts/auth.md", "knowledge", "create",
-            "Added auth patterns page", session_id=session["id"],
+            tmp_db, "1_drafts/sessions/abc-20260420-1030.md", "draft", "create",
+            "Created session draft", group_id=gid,
         )
         storage.create_memory_edit(
-            tmp_db, "knowledge/concepts/auth.md", "knowledge", "update",
-            "Added mutex section",
+            tmp_db, "1_drafts/sessions/abc-20260420-1030.md", "draft", "update",
+            "Edited session draft",
         )
 
         history = storage.get_memory_history(tmp_db)
         assert len(history) == 2
 
-        filtered = storage.get_memory_history(tmp_db, page_path="knowledge/concepts/auth.md")
+        filtered = storage.get_memory_history(
+            tmp_db, page_path="1_drafts/sessions/abc-20260420-1030.md")
         assert len(filtered) == 2
 
     def test_history_limit(self, tmp_db):
         for i in range(5):
-            storage.create_memory_edit(tmp_db, f"knowledge/page{i}.md", "knowledge", "create", f"page {i}")
+            storage.create_memory_edit(
+                tmp_db, f"1_drafts/sessions/p{i}.md", "draft", "create", f"p{i}")
         history = storage.get_memory_history(tmp_db, limit=3)
         assert len(history) == 3

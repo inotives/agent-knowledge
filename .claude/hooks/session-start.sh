@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SessionStart — create session, persist ID, read project from .env
+# SessionStart — start group, persist GROUP_ID, read project from .env
 set -euo pipefail
 case "${CLAUDE_PROJECT_DIR:-}" in */.agent-knowledge/memory*) exit 0;; esac
 
@@ -9,6 +9,9 @@ if [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ -f "$CLAUDE_PROJECT_DIR/.env" ]; then
     [ -n "${AKW_PROJECT:-}" ] && PROJECT_FLAG="--project $AKW_PROJECT"
 fi
 
-SESSION_ID=$(akw session start --agent claude $PROJECT_FLAG 2>/dev/null) || exit 0
-[ -n "${CLAUDE_ENV_FILE:-}" ] && [ -n "$SESSION_ID" ] && echo "export AKW_SESSION_ID=$SESSION_ID" >> "$CLAUDE_ENV_FILE"
+WD_FLAG=""
+[ -n "${CLAUDE_PROJECT_DIR:-}" ] && WD_FLAG="--working-dir $CLAUDE_PROJECT_DIR"
+
+GROUP_ID=$(akw group start --agent claude $PROJECT_FLAG $WD_FLAG 2>/dev/null) || exit 0
+[ -n "${CLAUDE_ENV_FILE:-}" ] && [ -n "$GROUP_ID" ] && echo "export AKW_GROUP_ID=$GROUP_ID" >> "$CLAUDE_ENV_FILE"
 exit 0

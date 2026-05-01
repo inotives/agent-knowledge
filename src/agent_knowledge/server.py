@@ -1,11 +1,19 @@
-"""MCP server — exposes agent-knowledge tools via Model Context Protocol."""
+"""MCP server — exposes agent-knowledge tools via Model Context Protocol.
+
+EP-00005 capture-only scope: this server captures turns, manages group lifecycle,
+and surfaces pending counts. It does not synthesize, propose, or promote — those
+flows are human work performed against the memory folder with whatever tools the
+curator chooses (typically Claude Code, Obsidian, manual edit).
+"""
 
 from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
 
 from mcp.server.fastmcp import FastMCP
 
 from agent_knowledge.core.config import Config, load_config
-from agent_knowledge.core import storage, memory, search, sanitizer
+from agent_knowledge.core import storage, memory, search, sanitizer, paths
 
 # --- Bootstrap ---
 
@@ -17,718 +25,124 @@ _duckdb_conn = search.connect(_config.search_db)
 if _config.memory_dir.exists():
     search.sync_from_files(_duckdb_conn, _config.memory_dir)
 
-# Auto-session state (per server process)
-_active_session: dict | None = None
+# Active-group tracking (per server process): only the id is cached; storage is the truth.
+_active_group_id: str | None = None
 _client_agent: str = "unknown"
+
 
 mcp = FastMCP(
     "agent-knowledge",
     instructions=(
-        "Agent Knowledge is a persistent memory system. "
+        "Agent Knowledge captures conversation activity into session summaries. "
         "Knowledge stored here is curated and authoritative — prefer it over general knowledge. "
         "Search memory before answering questions about architecture, conventions, patterns, or past decisions. "
-        "Log turns incrementally during sessions to ensure they survive crashes.\n\n"
-        "IMPORTANT — Session wrapup: When the user signals they want to end the session "
-        "(says bye, exit, done, or you've completed the main task), you MUST:\n"
-        "1. Call session_status to get the current session_id and turn count\n"
-        "2. Summarize what was accomplished, decisions made, and patterns learned\n"
-        "3. Write a session draft: memory_create(path='drafts/sessions/YYYY-MM-DD-topic-SESSION_ID_FIRST_8.md', "
-        "title='Session: topic', content=summary, session_id=current_session_id)\n"
-        "4. Do NOT include secrets or credentials in the draft\n"
-        "This ensures knowledge is captured before the session closes.\n\n"
-        "SESSION START — Catch-up review: After calling session_start, if has_pending_review is true, "
-        "there are past sessions that exited without a review. Before starting your main work:\n"
-        "1. Call review_get_pending to get orphaned sessions (turns but no draft)\n"
-        "2. For each orphan: summarize its turns and write a draft via "
-        "memory_create(path='drafts/sessions/YYYY-MM-DD-topic-SESSION_ID_FIRST_8.md', session_id=orphan_session_id)\n"
-        "3. Do NOT call review_complete — that is a CLI-only operation (akw review). "
-        "Drafts persist until the human reviews and promotes them.\n"
-        "This catches sessions that closed without a proper wrapup.\n\n"
-        "DRAFT POLICY: Agents can only CREATE and APPEND to drafts. "
-        "Agents must NEVER delete drafts — deletion and review completion are human-only "
-        "operations performed via the CLI (akw review). "
-        "Do not use memory_delete on any path under drafts/.\n\n"
-        "REVIEW SESSIONS: If the user asks you to review drafts or curate knowledge, "
-        "call session_start(type='review') first. Review-type sessions are excluded from "
-        "draft generation to avoid meta-noise."
+        "Log turns incrementally during a group to ensure they survive crashes.\n\n"
+        "GROUP LIFECYCLE: A group is one logical unit of work (one Claude session, one barebone "
+        "conversation, or one barebone task). A group may have multiple segments over time "
+        "(continuation reuses the same group_id and starts a new segment). Each segment is a "
+        "start→end pair on the `turns` table.\n\n"
+        "WRAP-UP: When the user signals the end of a session (says bye, exit, done, or you've "
+        "completed the main task), you MUST:\n"
+        "1. Call group_status to confirm the active group_id and segment.\n"
+        "2. Summarize what was accomplished, decisions made, and patterns learned.\n"
+        "3. Write a session draft via memory_create(path='1_drafts/sessions/<group_first_8>-<segment_compact_iso>.md', "
+        "title='Session: <topic>', content=summary, group_id=<active_group_id>).\n"
+        "4. Call group_end (no args needed — closes the active segment).\n"
+        "Do NOT include secrets, API keys, tokens, or credentials in the draft.\n\n"
+        "PENDING COUNTS: group_start returns a `pending` field. If non-zero, surface to the user — "
+        "for example: \"You have N session summaries and M incomplete segments waiting. Open the "
+        "memory folder if you want to review summaries; run `akw recover` for incomplete ones.\" "
+        "Do NOT auto-process pending items. The user opts in.\n\n"
+        "MEMORY LAYOUT: The deployed memory folder is a numbered three-tier wiki. Numeric "
+        "prefixes encode promotion order (1 → 2 → 3); `0_configs/` is the wiki contract, "
+        "not a tier:\n"
+        "- `0_configs/`        templates + rules (curator-only)\n"
+        "- `1_drafts/`         Tier 1 — agent-writable drafts (see DRAFT STAGING below)\n"
+        "- `2_knowledges/`     Tier 2 — curated, durable knowledge (curator-only)\n"
+        "- `3_intelligences/`  Tier 3 — skills + agent personas (curator-only)\n\n"
+        "DRAFT STAGING: Inside `1_drafts/`, the nested numeric prefix on each subfolder "
+        "signals the *promotion target* — where a draft lands once curated:\n"
+        "- `1_drafts/sessions/`       session summaries (one per segment) — written via the WRAP-UP flow\n"
+        "- `1_drafts/2_knowledges/`   drafts targeting Tier 2 knowledge pages\n"
+        "- `1_drafts/2_notes/`        ad-hoc notes (will promote to `2_knowledges/notes/`)\n"
+        "- `1_drafts/2_researches/`   research outputs (will promote to `2_knowledges/researches/`)\n"
+        "- `1_drafts/3_skills/`       drafts targeting Tier 3 skills\n"
+        "Pick the staging folder that matches the *promotion target* of the draft you're writing.\n\n"
+        "TIER WRITE BOUNDARY: memory_create and memory_update REJECT writes to `2_knowledges/`, "
+        "`3_intelligences/`, `0_configs/`, and `1_drafts/_archived/`. Curated tiers are written "
+        "by humans only, via their editor on the file system. Synthesis from drafts "
+        "to knowledge is a human activity outside this MCP — see "
+        "`0_configs/rules/knowledge-management.md` in the deployed memory folder for conventions.\n\n"
+        "WRITE CARVE-OUTS: A small set of paths inside curated tiers are agent-writable:\n"
+        "- `2_knowledges/preferences/` — user preferences (e.g. tooling, conventions, "
+        "stated likes/dislikes). Use `memory_create` / `memory_update` directly.\n"
+        "Deletes of carve-out pages do NOT unlink — they archive to `<tier>/_archived/...`. "
+        "Call `memory_delete` and the server moves the file for you.\n\n"
+        "DRAFT POLICY: Agents create and append to `1_drafts/`. Agents must NEVER delete "
+        "drafts and must NEVER write to `1_drafts/_archived/` — archiving is a curator action via "
+        "`akw archive` or manual move."
     ),
 )
 
 
-def _ensure_session() -> dict:
-    """Get or create an active session. Adopts hook-created sessions from SQLite."""
-    global _active_session
+# --- Helpers ---
 
-    # If we have a cached active session, verify it's still open
-    if _active_session is not None:
-        session = storage.get_session(_sqlite_conn, _active_session["id"])
-        if session and session["ended_at"] is None:
-            return session
-        _active_session = None
+def _ensure_group(metadata: dict | None = None) -> dict:
+    """Get or create an active group. Adopts the most recent open group if cached id is invalid.
 
-    # Check SQLite for the most recent open session (e.g. created by hook)
-    session = storage.get_most_recent_open_session(_sqlite_conn)
-    if session:
-        _active_session = session
-        return session
-
-    # No open session — auto-create one
-    session = storage.create_session(
-        _sqlite_conn, project_id=None, agent=_client_agent, session_type="coding",
-    )
-    _active_session = session
-    return session
-
-
-# --- MCP Prompts ---
-
-@mcp.prompt()
-def session_bootstrap() -> str:
-    """Start a new session with the Agent Knowledge system.
-
-    Sessions may already be active (created by hooks or auto-session).
-    Call session_start to register your project and upgrade the session,
-    or just begin logging turns — a session is auto-created on first tool use.
-
-    Follow these steps:
-    1. Call session_start (optionally with project_id, agent, type). If a session already exists, it's upgraded.
-    2. If has_pending_review is true, call review_get_pending and process:
-       - For orphaned sessions: generate session drafts from their raw turns using memory_create (path: drafts/sessions/..., include session_id param).
-       - For unreviewed drafts: synthesize knowledge drafts using memory_create (path: drafts/knowledge/...).
-       - Drafts persist for the user to review and promote later (review completion is CLI-only).
-    3. Read the recommended_context returned by session_start.
-    4. Begin your work. Log turns incrementally using session_log (session_id is optional).
+    Returns the group_status-shaped dict for the active group's current segment.
     """
-    return (
-        "Start a new Agent Knowledge session:\n"
-        "1. Call session_start (all params optional — auto-session may already exist)\n"
-        "2. If has_pending_review: call review_get_pending, create drafts for orphans + unreviewed sessions\n"
-        "3. Read recommended_context from session_start response\n"
-        "4. Begin work, log turns incrementally with session_log (session_id optional)\n"
-    )
+    global _active_group_id
 
+    cached_id = _active_group_id
+    if cached_id is not None:
+        latest = storage._latest_turn(_sqlite_conn, cached_id)
+        if latest is not None and latest["kind"] not in ("end", "idle_close"):
+            start = storage._latest_start_turn(_sqlite_conn, cached_id)
+            return {
+                "group_id": cached_id,
+                "segment_start_at": start["created_at"] if start else None,
+            }
+        _active_group_id = None
 
-@mcp.prompt()
-def session_wrapup() -> str:
-    """End the current session with proper review.
-
-    Follow these steps:
-    1. Summarize your session's turns — what was asked, decided, and learned.
-    2. Write a session draft using memory_create:
-       - path: drafts/sessions/YYYY-MM-DD-<topic>-<session_id_first_8>.md
-       - Include the session_id param to link the draft to the session.
-       - Content should capture key decisions, patterns discovered, and outcomes.
-    3. Call session_end (no args needed — ends the active session).
-
-    Note: session_end may also be called by a SessionEnd hook as a safety net.
-    session_end is idempotent, so duplicate calls are safe.
-
-    Do NOT include secrets, API keys, tokens, or credentials in the session draft.
-    """
-    return (
-        "End your Agent Knowledge session:\n"
-        "1. Summarize turns — what was asked, decided, learned\n"
-        "2. Write session draft: memory_create(path='drafts/sessions/YYYY-MM-DD-topic-SESSION_ID_FIRST_8.md', session_id=...)\n"
-        "3. Call session_end (no args needed)\n"
-        "Do NOT include secrets or credentials in the draft.\n"
-    )
-
-
-# --- Project Management ---
-
-@mcp.tool()
-def project_create(name: str, path: str, tags: list[str] | None = None) -> dict:
-    """Register a project. Tags are domain labels (e.g. ["python", "web"]) used to match relevant skills at session start."""
-    return storage.create_project(_sqlite_conn, name, path, tags)
-
-
-@mcp.tool()
-def project_list() -> list[dict]:
-    """List all registered projects."""
-    return storage.list_projects(_sqlite_conn)
-
-
-# --- Session Management ---
-
-@mcp.tool()
-def session_start(
-    project_id: str | None = None,
-    agent: str | None = None,
-    type: str = "coding",
-    continue_session: str | None = None,
-    metadata: dict | None = None,
-) -> dict:
-    """Begin or continue a session. Returns session ID, has_pending_review flag, and recommended context.
-
-    All parameters are optional. If an auto-created session already exists, it is
-    upgraded with the provided metadata instead of creating a duplicate.
-
-    Auto-closes orphaned sessions older than 24 hours.
-    Agent should call review_get_pending if has_pending_review is true.
-
-    Args:
-        project_id: Optional project this session belongs to.
-        agent: Agent name (e.g. "claude", "codex", "opencode"). Auto-detected if omitted.
-        type: Session type — "coding", "research", "debugging", "planning", or "review".
-        continue_session: Optional session ID to continue from a previous conversation.
-        metadata: Optional dict of extra session context (e.g. working_dir, repo_url, harness_version).
-    """
-    global _active_session
-
-    # Auto-close orphans
-    storage.close_orphaned_sessions(_sqlite_conn)
-
-    agent_name = agent or _client_agent
-
-    # Resolve project name to ID if needed
-    if project_id:
-        project = storage.get_project(_sqlite_conn, project_id)
-        if project is None:
-            # Try matching by name
-            for p in storage.list_projects(_sqlite_conn):
-                if p["name"] == project_id:
-                    project_id = p["id"]
-                    break
-            else:
-                # Auto-create project with the given name
-                new_project = storage.create_project(_sqlite_conn, project_id, "")
-                project_id = new_project["id"]
-
-    # Session continuation: end current, reopen the continued session
-    if continue_session:
-        if _active_session:
-            storage.end_session(_sqlite_conn, _active_session["id"])
-        session = storage.reopen_session(_sqlite_conn, continue_session)
-        if session is None:
-            return {"error": f"Session not found: {continue_session}"}
-        # Upgrade metadata if provided
-        if project_id or agent:
-            session = storage.update_session_metadata(
-                _sqlite_conn, session["id"],
-                project_id=project_id, agent=agent_name if agent else None,
-                session_type=type,
-            )
-        _active_session = session
-        turns = storage.get_turns(_sqlite_conn, session["id"])
-        project = storage.get_project(_sqlite_conn, session["project_id"]) if session["project_id"] else None
+    open_groups = storage.get_open_groups(_sqlite_conn)
+    if open_groups:
+        # Most recent open group wins.
+        chosen = max(open_groups, key=lambda g: g["latest_at"])
+        chosen_id: str = chosen["group_id"]
+        _active_group_id = chosen_id
+        start = storage._latest_start_turn(_sqlite_conn, chosen_id)
         return {
-            "session": session,
-            "continued": True,
-            "previous_turns": turns,
-            "has_pending_review": False,
-            "recommended_context": _get_recommended_context(project),
+            "group_id": chosen_id,
+            "segment_start_at": start["created_at"] if start else None,
         }
 
-    # If auto-session already exists, upgrade it with caller's metadata
-    if _active_session:
-        session = storage.get_session(_sqlite_conn, _active_session["id"])
-        if session and session["ended_at"] is None:
-            session = storage.update_session_metadata(
-                _sqlite_conn, session["id"],
-                project_id=project_id, agent=agent_name,
-                session_type=type,
-            )
-            _active_session = session
-            project = storage.get_project(_sqlite_conn, session["project_id"]) if session["project_id"] else None
-            all_sessions = storage.list_sessions(_sqlite_conn, project_id=project_id)
-            has_pending = any(
-                s["ended_at"] is not None
-                and s["reviewed_at"] is None
-                and s["id"] != session["id"]
-                for s in all_sessions
-            )
-            return {
-                "session": session,
-                "upgraded": True,
-                "has_pending_review": has_pending,
-                "recommended_context": _get_recommended_context(project),
-            }
-
-    # Create new session
-    session = storage.create_session(_sqlite_conn, project_id, agent_name, type, metadata=metadata)
-    _active_session = session
-
-    # Check for pending reviews
-    all_sessions = storage.list_sessions(_sqlite_conn, project_id=project_id)
-    has_pending = any(
-        s["ended_at"] is not None
-        and s["reviewed_at"] is None
-        and s["id"] != session["id"]
-        for s in all_sessions
-    )
-
-    project = storage.get_project(_sqlite_conn, project_id) if project_id else None
+    # No open group — start a fresh one.
+    md = dict(metadata or {})
+    md.setdefault("agent", _client_agent)
+    result = storage.start_group(_sqlite_conn, agent=_client_agent, metadata=md)
+    _active_group_id = result["group_id"]
     return {
-        "session": session,
-        "has_pending_review": has_pending,
-        "recommended_context": _get_recommended_context(project),
+        "group_id": result["group_id"],
+        "segment_start_at": result["segment_start_at"],
     }
 
 
-@mcp.tool()
-def session_status() -> dict:
-    """Get the current active session info. Use this to get the session_id for drafts."""
-    session = _ensure_session()
-    turns = storage.get_turns(_sqlite_conn, session["id"])
+def _pending_counts() -> dict:
+    """Compute the `pending` payload returned by group_start.
+
+    `unarchived_session_drafts` comes from indexed draft_state SQL (Phase 2).
+    `incomplete_segments` is orphans + closed-no-draft (still scan-based; cheap at
+    this scale, may move to draft_state in a follow-up).
+    """
+    unarchived = storage.count_unarchived_session_drafts(_sqlite_conn)
+    orphan_count = len(storage.get_orphaned_groups(_sqlite_conn))
+    closed_no_draft_count = len(storage.get_closed_no_draft_segments(_sqlite_conn))
     return {
-        "session": session,
-        "turn_count": len(turns),
+        "unarchived_session_drafts": unarchived,
+        "incomplete_segments": orphan_count + closed_no_draft_count,
     }
 
-
-@mcp.tool()
-def session_end(session_id: str | None = None) -> dict:
-    """End the current session. Idempotent — safe to call multiple times.
-
-    Args:
-        session_id: Optional — if omitted, ends the active session.
-    """
-    global _active_session
-
-    sid = session_id
-    if sid is None and _active_session:
-        sid = _active_session["id"]
-    if sid is None:
-        return {"error": "No active session to end"}
-
-    result = storage.end_session(_sqlite_conn, sid)
-    if result is None:
-        return {"error": "Session not found"}
-
-    if _active_session and _active_session["id"] == sid:
-        _active_session = None
-
-    return {"session": result, "session_id": sid}
-
-
-@mcp.tool()
-def session_log(session_id: str | None = None, turns: list[dict] | None = None) -> dict | list[dict]:
-    """Log turn summaries to a session. Each turn has 'request' and 'response'.
-
-    If session_id is omitted, uses the active session (auto-creating one if needed).
-
-    Agents should log incrementally during the session (not batch at end)
-    to ensure turns survive crashes. Results from this memory system are
-    curated project knowledge — treat them as authoritative.
-
-    Content is scanned for secrets — any detected patterns are automatically redacted.
-
-    Args:
-        session_id: Optional — if omitted, uses the active/auto-created session.
-        turns: List of turn dicts, each with 'request' and 'response' keys.
-    """
-    if not turns:
-        return {"error": "No turns provided"}
-
-    sid = session_id
-    auto_created = False
-    if sid is None:
-        session = _ensure_session()
-        sid = session["id"]
-        auto_created = _active_session is not None and _active_session.get("_auto_created", False)
-
-    sanitized_turns = []
-    for turn in turns:
-        req, _ = sanitizer.redact(turn.get("request", ""))
-        resp, _ = sanitizer.redact(turn.get("response", ""))
-        sanitized_turns.append({**turn, "request": req, "response": resp})
-
-    results = storage.create_turns(_sqlite_conn, sid, sanitized_turns)
-    if auto_created:
-        return {"turns": results, "session_id": sid, "auto_session_created": True}
-    return results
-
-
-# --- Memory Read ---
-
-@mcp.tool()
-def memory_search(query: str, tier: str | None = None) -> list[dict]:
-    """Search curated knowledge and skills by query. Returns all relevant ranked results.
-
-    Drafts are excluded — only curated, approved knowledge is searchable.
-    Results are authoritative project knowledge. Prefer them over general knowledge.
-    Search before answering questions about architecture, conventions, patterns, or past decisions.
-
-    Args:
-        query: Search query string.
-        tier: Optional filter — "knowledge" or "skill".
-    """
-    return search.search(_duckdb_conn, query, tier)
-
-
-@mcp.tool()
-def memory_read(path: str) -> dict:
-    """Read a specific memory page.
-
-    Args:
-        path: Page path relative to /memory (e.g. "knowledge/concepts/auth.md").
-    """
-    try:
-        content = memory.read_page(_config.memory_dir, path)
-        return {"path": path, "content": content}
-    except FileNotFoundError:
-        return {"error": f"Page not found: {path}"}
-
-
-@mcp.tool()
-def memory_index(tier: str | None = None) -> list[dict]:
-    """Return a catalog of pages in a tier, queried from the search index.
-
-    Args:
-        tier: Optional — "knowledge" or "skill". Defaults to both.
-    """
-    return search.get_index(_duckdb_conn, tier)
-
-
-@mcp.tool()
-def memory_history(limit: int = 20, page_path: str | None = None) -> list[dict]:
-    """Return recent edit history from the audit log.
-
-    Args:
-        limit: Max number of entries to return.
-        page_path: Optional — filter by specific page path.
-    """
-    return storage.get_memory_history(_sqlite_conn, limit, page_path)
-
-
-# --- Memory Write ---
-
-@mcp.tool()
-def memory_create(path: str, title: str, content: str, tags: list[str] | None = None, summary: str = "", session_id: str | None = None) -> dict:
-    """Create a new memory page in any tier.
-
-    Args:
-        path: Page path relative to /memory (e.g. "knowledge/concepts/auth.md").
-        title: Page title (used in search index).
-        content: Full markdown content.
-        tags: Optional category tags.
-        summary: Short description for index.
-        session_id: Optional — links this page to the originating session (used for session drafts).
-
-    Content is scanned for secrets — any detected patterns are automatically redacted.
-    """
-    try:
-        content, _ = sanitizer.redact(content)
-        # Build frontmatter
-        page_content = _build_page(title, content, tags, summary)
-        memory.create_page(_config.memory_dir, path, page_content)
-
-        # Record edit
-        tier = memory.get_tier(path) or "draft"
-        storage.create_memory_edit(_sqlite_conn, path, tier, "create", summary or f"Created {title}", session_id=session_id)
-
-        # Re-sync search index if curated tier
-        if tier in ("knowledge", "skill"):
-            search.sync_from_files(_duckdb_conn, _config.memory_dir)
-
-        return {"path": path, "title": title, "status": "created"}
-    except FileExistsError:
-        return {"error": f"Page already exists: {path}"}
-
-
-@mcp.tool()
-def memory_update(path: str, content: str, summary: str = "") -> dict:
-    """Update an existing memory page.
-
-    Args:
-        path: Page path relative to /memory.
-        content: New full markdown content.
-        summary: What changed and why.
-
-    Content is scanned for secrets — any detected patterns are automatically redacted.
-    """
-    try:
-        content, _ = sanitizer.redact(content)
-        memory.update_page(_config.memory_dir, path, content)
-
-        tier = memory.get_tier(path) or "draft"
-        storage.create_memory_edit(_sqlite_conn, path, tier, "update", summary or "Updated page")
-
-        if tier in ("knowledge", "skill"):
-            search.sync_from_files(_duckdb_conn, _config.memory_dir)
-
-        return {"path": path, "status": "updated"}
-    except FileNotFoundError:
-        return {"error": f"Page not found: {path}"}
-
-
-@mcp.tool()
-def memory_delete(path: str, reason: str = "") -> dict:
-    """Delete a memory page.
-
-    Drafts (paths under drafts/) cannot be deleted via this tool.
-    Draft cleanup is handled by the CLI (akw review) after human review.
-
-    Args:
-        path: Page path relative to /memory.
-        reason: Why this page is being deleted.
-    """
-    if path.startswith("drafts/"):
-        return {"error": "Drafts cannot be deleted by agents. Use the CLI (akw review) for draft cleanup."}
-
-    try:
-        memory.delete_page(_config.memory_dir, path)
-
-        tier = memory.get_tier(path) or "draft"
-        storage.create_memory_edit(_sqlite_conn, path, tier, "delete", reason or "Deleted page")
-
-        if tier in ("knowledge", "skill"):
-            search.sync_from_files(_duckdb_conn, _config.memory_dir)
-
-        return {"path": path, "status": "deleted"}
-    except FileNotFoundError:
-        return {"error": f"Page not found: {path}"}
-
-
-# --- Review ---
-
-@mcp.tool()
-def review_get_pending(project_id: str | None = None) -> dict:
-    """Get all items needing review.
-
-    Returns two types:
-    (1) Orphaned sessions — ended sessions with turns but no session draft
-        (agent crashed before writing draft). Agent should generate drafts from raw turns.
-    (2) Unreviewed session drafts from previous days — ready for daily review synthesis.
-
-    Args:
-        project_id: Optional — filter by project.
-    """
-    # Orphaned sessions needing draft generation
-    orphans = storage.get_sessions_needing_drafts(_sqlite_conn)
-    orphan_data = []
-    for session in orphans:
-        if project_id and session["project_id"] != project_id:
-            continue
-        turns = storage.get_turns(_sqlite_conn, session["id"])
-        orphan_data.append({"session": session, "turns": turns})
-
-    # Unreviewed session drafts from previous days
-    unreviewed = storage.get_unreviewed_sessions(_sqlite_conn, project_id=project_id)
-    unreviewed_drafts = []
-    for session in unreviewed:
-        draft_path = storage.get_session_draft_path(_sqlite_conn, session["id"])
-        if draft_path:
-            try:
-                content = memory.read_page(_config.memory_dir, draft_path)
-                unreviewed_drafts.append({
-                    "session": session,
-                    "draft_path": draft_path,
-                    "content": content,
-                })
-            except FileNotFoundError:
-                # Draft file missing — treat as orphan
-                turns = storage.get_turns(_sqlite_conn, session["id"])
-                orphan_data.append({"session": session, "turns": turns})
-
-    return {
-        "orphaned_sessions": orphan_data,
-        "unreviewed_drafts": unreviewed_drafts,
-    }
-
-
-def _review_complete_internal(conn, config, session_ids: list[str]) -> dict:
-    """Internal: mark sessions reviewed and delete drafts. Used by CLI only."""
-    deleted_drafts = []
-    for sid in session_ids:
-        storage.set_session_reviewed(conn, sid)
-
-        draft_path = storage.get_session_draft_path(conn, sid)
-        if draft_path:
-            try:
-                memory.delete_page(config.memory_dir, draft_path)
-                deleted_drafts.append(draft_path)
-            except FileNotFoundError:
-                pass
-
-    return {
-        "sessions_reviewed": len(session_ids),
-        "drafts_deleted": deleted_drafts,
-    }
-
-
-# --- Promotion ---
-
-@mcp.tool()
-def promote_to_knowledge(draft_path: str, target_path: str) -> dict:
-    """Move a knowledge draft into curated knowledge.
-
-    Operates on files in /memory/drafts/knowledge/ (not session drafts).
-
-    Args:
-        draft_path: Source path in /memory/drafts/knowledge/.
-        target_path: Destination path in /memory/knowledge/.
-    """
-    if not draft_path.startswith("drafts/knowledge/"):
-        return {"error": "Can only promote from drafts/knowledge/"}
-    if not target_path.startswith("knowledge/"):
-        return {"error": "Target must be in knowledge/"}
-
-    try:
-        memory.move_page(_config.memory_dir, draft_path, target_path)
-
-        storage.create_memory_edit(
-            _sqlite_conn, draft_path, "draft", "delete", f"Promoted to {target_path}")
-        storage.create_memory_edit(
-            _sqlite_conn, target_path, "knowledge", "create", f"Promoted from {draft_path}")
-
-        search.sync_from_files(_duckdb_conn, _config.memory_dir)
-
-        return {"status": "promoted", "from": draft_path, "to": target_path}
-    except FileNotFoundError:
-        return {"error": f"Draft not found: {draft_path}"}
-    except FileExistsError:
-        return {"error": f"Target already exists: {target_path}"}
-
-
-@mcp.tool()
-def promote_to_skill(source_path: str, target_path: str) -> dict:
-    """Move a knowledge page into skills. This is a user/human-driven action.
-
-    Args:
-        source_path: Source path in /memory/knowledge/.
-        target_path: Destination path in /memory/skills/.
-    """
-    if not source_path.startswith("knowledge/"):
-        return {"error": "Can only promote from knowledge/"}
-    if not target_path.startswith("skills/"):
-        return {"error": "Target must be in skills/"}
-
-    try:
-        memory.move_page(_config.memory_dir, source_path, target_path)
-
-        storage.create_memory_edit(
-            _sqlite_conn, source_path, "knowledge", "delete", f"Promoted to {target_path}")
-        storage.create_memory_edit(
-            _sqlite_conn, target_path, "skill", "create", f"Promoted from {source_path}")
-
-        search.sync_from_files(_duckdb_conn, _config.memory_dir)
-
-        return {"status": "promoted", "from": source_path, "to": target_path}
-    except FileNotFoundError:
-        return {"error": f"Source not found: {source_path}"}
-    except FileExistsError:
-        return {"error": f"Target already exists: {target_path}"}
-
-
-# --- Maintenance ---
-
-@mcp.tool()
-def maintain_reindex() -> dict:
-    """Rebuild the DuckDB search index from /memory/knowledge and /memory/skills files."""
-    count = search.sync_from_files(_duckdb_conn, _config.memory_dir)
-    return {"status": "reindexed", "pages_indexed": count}
-
-
-@mcp.tool()
-def maintain_get_stats(stale_days: int = 90) -> dict:
-    """Return structural stats for the memory system.
-
-    Reports orphaned pages, stale pages, page counts per tier, session stats.
-    The calling agent interprets and acts on the report.
-
-    Args:
-        stale_days: Pages with no updates in this many days are considered stale.
-    """
-    from datetime import datetime, timezone, timedelta
-
-    stale_cutoff = (datetime.now(timezone.utc) - timedelta(days=stale_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    # Page counts per tier
-    knowledge_pages = memory.list_pages(_config.memory_dir, "knowledge")
-    skill_pages = memory.list_pages(_config.memory_dir, "skills")
-    draft_pages = memory.list_pages(_config.memory_dir, "drafts")
-
-    # Stale pages (check file mtime)
-    stale = []
-    for pages, tier in [(knowledge_pages, "knowledge"), (skill_pages, "skills")]:
-        for page_path in pages:
-            full_path = _config.memory_dir / page_path
-            if full_path.exists():
-                mtime = datetime.fromtimestamp(full_path.stat().st_mtime, tz=timezone.utc)
-                if mtime.strftime("%Y-%m-%dT%H:%M:%SZ") < stale_cutoff:
-                    stale.append({"path": page_path, "tier": tier, "last_modified": mtime.isoformat()})
-
-    # Session stats
-    all_sessions = storage.list_sessions(_sqlite_conn)
-    reviewed = [s for s in all_sessions if s["reviewed_at"] is not None]
-    pending = [s for s in all_sessions if s["ended_at"] is not None and s["reviewed_at"] is None]
-    orphans = [s for s in all_sessions if s["ended_at"] is None]
-
-    return {
-        "pages": {
-            "knowledge": len(knowledge_pages),
-            "skills": len(skill_pages),
-            "drafts": len(draft_pages),
-        },
-        "stale_pages": stale,
-        "sessions": {
-            "total": len(all_sessions),
-            "reviewed": len(reviewed),
-            "pending_review": len(pending),
-            "orphaned": len(orphans),
-        },
-    }
-
-
-@mcp.tool()
-def maintain_purge(older_than_days: int = 365) -> dict:
-    """Delete reviewed sessions and turns older than retention period.
-
-    Only purges sessions where reviewed_at is set. Also removes any remaining
-    associated session draft files.
-
-    Args:
-        older_than_days: Sessions older than this many days will be purged.
-    """
-    from datetime import datetime, timezone, timedelta
-
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    # Find reviewed sessions older than cutoff
-    all_sessions = storage.list_sessions(_sqlite_conn)
-    to_purge = [
-        s for s in all_sessions
-        if s["reviewed_at"] is not None and s["started_at"] < cutoff
-    ]
-
-    purged_sessions = 0
-    purged_turns = 0
-    purged_drafts = []
-
-    for session in to_purge:
-        # Delete associated draft files
-        draft_path = storage.get_session_draft_path(_sqlite_conn, session["id"])
-        if draft_path:
-            try:
-                memory.delete_page(_config.memory_dir, draft_path)
-                purged_drafts.append(draft_path)
-            except FileNotFoundError:
-                pass
-
-        # Delete turns
-        turns = storage.get_turns(_sqlite_conn, session["id"])
-        purged_turns += len(turns)
-        _sqlite_conn.execute("DELETE FROM turns WHERE session_id = ?", (session["id"],))
-
-        # Delete memory_edits for this session
-        _sqlite_conn.execute("DELETE FROM memory_edits WHERE session_id = ?", (session["id"],))
-
-        # Delete session
-        _sqlite_conn.execute("DELETE FROM sessions WHERE id = ?", (session["id"],))
-        purged_sessions += 1
-
-    _sqlite_conn.commit()
-
-    return {
-        "purged_sessions": purged_sessions,
-        "purged_turns": purged_turns,
-        "purged_drafts": purged_drafts,
-        "cutoff_date": cutoff,
-    }
-
-
-# --- Helpers ---
 
 def _get_recommended_context(project: dict | None) -> list[dict]:
     """Get matching skills and recent knowledge for a project, with content inline."""
@@ -738,16 +152,13 @@ def _get_recommended_context(project: dict | None) -> list[dict]:
     paths: list[str] = []
     tags = project.get("tags", [])
 
-    # Match skills by project tags
     for tag in tags:
         skill_results = search.search(_duckdb_conn, tag, tier="skill")
         paths.extend(r["path"] for r in skill_results)
 
-    # Add recent knowledge
     knowledge = search.get_index(_duckdb_conn, tier="knowledge")
     paths.extend(r["path"] for r in knowledge[:5])
 
-    # Deduplicate and load content
     seen = set()
     results = []
     for path in paths:
@@ -759,7 +170,6 @@ def _get_recommended_context(project: dict | None) -> list[dict]:
             results.append({"path": path, "content": content})
         except FileNotFoundError:
             continue
-
     return results
 
 
@@ -778,6 +188,474 @@ def _build_page(title: str, content: str, tags: list[str] | None, summary: str) 
     parts.append("")
     parts.append(content)
     return "\n".join(parts)
+
+
+def _reject_curated_path(path: str) -> dict | None:
+    """Tier write boundary (EP-00008). Wraps `paths.reject_curated_write` as a tool result."""
+    reason = paths.reject_curated_write(path)
+    return {"error": reason} if reason else None
+
+
+# --- MCP Prompts ---
+
+@mcp.prompt()
+def group_bootstrap() -> str:
+    """Start a new group with the Agent Knowledge system.
+
+    A group may already be active (created by a SessionStart hook). Calling group_start
+    upgrades it with caller-provided metadata; logging turns auto-creates one if needed.
+    """
+    return (
+        "Start an Agent Knowledge group:\n"
+        "1. Call group_start (all params optional — auto-group may already exist).\n"
+        "2. If pending counts are non-zero, surface them to the user. Do NOT auto-process.\n"
+        "3. Read recommended_context from the response.\n"
+        "4. Begin work, log turns incrementally with group_log.\n"
+    )
+
+
+@mcp.prompt()
+def group_wrapup() -> str:
+    """End the current group's segment with a session draft.
+
+    1. Summarize the current segment's turns — what was asked, decided, learned.
+    2. Write a session draft via memory_create:
+       - path: 1_drafts/sessions/<group_first_8>-<segment_compact_iso>.md
+       - Pass group_id to bind the draft to the segment.
+    3. Call group_end (no args needed — closes the active segment).
+
+    Do NOT include secrets in the draft.
+    """
+    return (
+        "End your Agent Knowledge group's segment:\n"
+        "1. Summarize the segment's turns (what was asked, decided, learned).\n"
+        "2. Write a session draft: memory_create(path='1_drafts/sessions/<group_first_8>-<segment_compact_iso>.md', group_id=...).\n"
+        "3. Call group_end.\n"
+        "Do NOT include secrets or credentials in the draft.\n"
+    )
+
+
+# --- Project Management ---
+
+@mcp.tool()
+def project_create(name: str, path: str, tags: list[str] | None = None) -> dict:
+    """Register a project. Tags are domain labels (e.g. ["python", "web"])."""
+    return storage.create_project(_sqlite_conn, name, path, tags)
+
+
+@mcp.tool()
+def project_list() -> list[dict]:
+    """List all registered projects."""
+    return storage.list_projects(_sqlite_conn)
+
+
+# --- Group Management ---
+
+@mcp.tool()
+def group_start(
+    group_id: str | None = None,
+    agent: str | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    """Begin or continue a group. Returns group_id, pending counts, recommended context.
+
+    All parameters are optional. If a `group_id` is provided and the group's latest
+    turn is open and stale (>30 min idle), an `idle_close` is written for the stale
+    segment before the new `start` (continuation-by-implicit-resumption).
+
+    Args:
+        group_id: Optional — pass to continue a known group; omit to start a new one.
+        agent: Optional agent label (e.g. "claude", "codex"); auto-detected if omitted.
+        metadata: Optional dict (e.g. {project_id, working_dir, conversation_id}).
+    """
+    global _active_group_id
+
+    agent_name = agent or _client_agent
+    md = dict(metadata or {})
+    md.setdefault("agent", agent_name)
+
+    result = storage.start_group(
+        _sqlite_conn,
+        group_id=group_id,
+        agent=agent_name,
+        metadata=md,
+    )
+    _active_group_id = result["group_id"]
+
+    # Pull project metadata for recommended_context (if metadata.project_id resolves).
+    project = None
+    project_id = md.get("project_id")
+    if project_id:
+        project = storage.get_project(_sqlite_conn, project_id)
+        if project is None:
+            for p in storage.list_projects(_sqlite_conn):
+                if p["name"] == project_id:
+                    project = p
+                    break
+
+    payload: dict = {
+        "group_id": result["group_id"],
+        "segment_start_at": result["segment_start_at"],
+        "pending": _pending_counts(),
+        "recommended_context": _get_recommended_context(project),
+    }
+    if result.get("idle_closed_segment"):
+        payload["idle_closed_segment"] = result["idle_closed_segment"]
+    return payload
+
+
+@mcp.tool()
+def group_status() -> dict:
+    """Get the current active group + segment metadata."""
+    active = _ensure_group()
+    gid = active["group_id"]
+    seg_start = active.get("segment_start_at")
+
+    segment_turn_count = 0
+    if seg_start:
+        segment_turn_count = sum(
+            1 for t in storage.get_current_segment_turns(_sqlite_conn, gid)
+            if t["kind"] == "turn"
+        )
+
+    return {
+        "group_id": gid,
+        "segment_start_at": seg_start,
+        "segment_turn_count": segment_turn_count,
+    }
+
+
+@mcp.tool()
+def group_end(group_id: str | None = None) -> dict:
+    """End the current segment. Idempotent. Returns a summarization hint.
+
+    The hint instructs the agent to write a session draft at the computed path. The
+    draft path embeds the segment_start_at so multiple segments of the same group
+    each get their own draft (continuation produces N drafts, never overwrites).
+
+    Args:
+        group_id: Optional — if omitted, ends the active group's current segment.
+    """
+    global _active_group_id
+
+    gid = group_id or _active_group_id
+    if gid is None:
+        return {"error": "No active group to end"}
+
+    result = storage.end_group(_sqlite_conn, gid, kind="end")
+    if result is None:
+        return {"error": f"Group has no turns: {gid}"}
+
+    if _active_group_id == gid:
+        _active_group_id = None
+
+    seg_start = result["segment_start_at"]
+    draft_path = paths.session_draft_path(gid, seg_start) if seg_start else None
+    hint = (
+        f"Segment {seg_start} → {result['segment_end_at']} closed. "
+        f"Summarize this segment's turns and write a session draft via "
+        f"memory_create(path='{draft_path}', group_id='{gid}', title=..., content=summary)."
+    ) if draft_path else "Segment closed."
+
+    return {
+        "group_id": gid,
+        "segment_start_at": seg_start,
+        "segment_end_at": result["segment_end_at"],
+        "draft_path": draft_path,
+        "summarization_hint": hint,
+    }
+
+
+@mcp.tool()
+def group_log(
+    group_id: str | None = None,
+    turns: list[dict] | None = None,
+) -> dict:
+    """Append `kind='turn'` rows to a group. Each turn has 'request' and 'response'.
+
+    If `group_id` is omitted, uses the active group (auto-creating if needed). Auto-handles
+    idle-close-on-stale: if the group's latest turn is open and >30 min old, writes an
+    `idle_close` for the stale segment and a fresh `start` before the requested turns.
+
+    Content is scanned for secrets — any detected patterns are automatically redacted.
+    """
+    if not turns:
+        return {"error": "No turns provided"}
+
+    gid = group_id
+    if gid is None:
+        active = _ensure_group()
+        gid = active["group_id"]
+
+    sanitized_turns = []
+    for turn in turns:
+        req, _ = sanitizer.redact(turn.get("request", ""))
+        resp, _ = sanitizer.redact(turn.get("response", ""))
+        sanitized_turns.append({**turn, "request": req, "response": resp})
+
+    result = storage.create_turns(_sqlite_conn, gid, sanitized_turns)
+
+    payload: dict = {
+        "group_id": gid,
+        "segment_start_at": result["segment_start_at"],
+        "turns": result["turns"],
+    }
+    if result.get("idle_closed_segment"):
+        payload["idle_closed_segment"] = result["idle_closed_segment"]
+        # Hint the agent that a stale segment just closed.
+        idle = result["idle_closed_segment"]
+        payload["summarization_hint"] = (
+            f"Idle-close fired: prior segment {idle.get('segment_start_at')} "
+            f"→ {idle.get('created_at')} closed. To summarize it, fetch its turns via "
+            f"`get_segment_turns` (CLI: `akw group turns {gid} --segment-start {idle.get('segment_start_at')}`) "
+            f"and write a session draft via memory_create."
+        )
+    return payload
+
+
+# --- Memory Read ---
+
+@mcp.tool()
+def memory_search(query: str, tier: str | None = None) -> list[dict]:
+    """Search drafts and curated knowledge by query (BM25).
+
+    Tiers: `knowledge`, `session_draft`, `session_archived`, `knowledge_draft`,
+    `note_draft`, `research_draft`, `skill_draft`. Pass `tier` to scope; omit
+    for an all-tier search.
+
+    Skills (`3_intelligences/skills/`) and agent personas (`3_intelligences/agents/`)
+    are intentionally NOT in this index — they have dedicated discovery tools.
+    """
+    return search.search(_duckdb_conn, query, tier)
+
+
+@mcp.tool()
+def memory_read(path: str) -> dict:
+    """Read a specific memory page."""
+    try:
+        content = memory.read_page(_config.memory_dir, path)
+        return {"path": path, "content": content}
+    except FileNotFoundError:
+        return {"error": f"Page not found: {path}"}
+
+
+@mcp.tool()
+def memory_index(tier: str | None = None) -> list[dict]:
+    """Return a catalog of pages in a tier, queried from the search index."""
+    return search.get_index(_duckdb_conn, tier)
+
+
+@mcp.tool()
+def memory_history(limit: int = 20, page_path: str | None = None) -> list[dict]:
+    """Return recent edit history from the audit log."""
+    return storage.get_memory_history(_sqlite_conn, limit, page_path)
+
+
+# --- Memory Write ---
+
+@mcp.tool()
+def memory_create(
+    path: str,
+    title: str,
+    content: str,
+    tags: list[str] | None = None,
+    summary: str = "",
+    group_id: str | None = None,
+) -> dict:
+    """Create a new memory page in `1_drafts/sessions/`. Curated tiers are rejected.
+
+    For session drafts, also writes a `draft_state` row so `pending` counts stay
+    O(1). The segment match is by computed canonical draft path:
+    `1_drafts/sessions/<group_first_8>-<segment_compact_iso>.md`.
+
+    Args:
+        path: Page path. Must NOT begin with `2_knowledges/`, `3_intelligences/`, `0_configs/`, or `1_drafts/_archived/`.
+        title: Page title.
+        content: Full markdown content (sanitized for secrets).
+        tags: Optional category tags.
+        summary: Short description for the index.
+        group_id: Optional — links the page to the originating group (used for session drafts).
+    """
+    rejection = _reject_curated_path(path)
+    if rejection:
+        return rejection
+
+    try:
+        content, _ = sanitizer.redact(content)
+        page_content = _build_page(title, content, tags, summary)
+        memory.create_page(_config.memory_dir, path, page_content)
+
+        tier = memory.get_tier(path) or "draft"
+        storage.create_memory_edit(
+            _sqlite_conn, path, tier, "create",
+            summary or f"Created {title}",
+            group_id=group_id,
+        )
+
+        # Phase 2: write a draft_state row for session drafts so pending counts
+        # use indexed SQL.
+        if path.startswith(paths.SESSIONS_DIR + "/") and group_id:
+            seg = _match_segment_for_draft_path(group_id, path)
+            if seg is not None:
+                storage.upsert_draft_state(
+                    _sqlite_conn,
+                    draft_path=path,
+                    group_id=group_id,
+                    segment_start_at=seg["segment_start_at"],
+                    segment_end_at=seg["segment_end_at"] or seg["segment_start_at"],
+                )
+
+        # Curated-tier writes never reach this point thanks to _reject_curated_path,
+        # so no search-index resync is needed (drafts aren't indexed).
+        return {"path": path, "title": title, "status": "created"}
+    except FileExistsError:
+        return {"error": f"Page already exists: {path}"}
+
+
+def _match_segment_for_draft_path(group_id: str, draft_path: str) -> dict | None:
+    """Find the segment whose canonical draft path matches `draft_path`.
+
+    Returns the segment dict (or None if no match). Linear scan over segments —
+    fine while groups have a handful of segments.
+    """
+    segments = storage.get_group_segments(_sqlite_conn, group_id)
+    for seg in segments:
+        seg_start = seg.get("segment_start_at")
+        if not seg_start:
+            continue
+        if paths.session_draft_path(group_id, seg_start) == draft_path:
+            return seg
+    return None
+
+
+@mcp.tool()
+def memory_update(path: str, content: str, summary: str = "") -> dict:
+    """Update an existing memory page. Curated tiers are rejected."""
+    rejection = _reject_curated_path(path)
+    if rejection:
+        return rejection
+
+    try:
+        content, _ = sanitizer.redact(content)
+        memory.update_page(_config.memory_dir, path, content)
+
+        tier = memory.get_tier(path) or "draft"
+        storage.create_memory_edit(
+            _sqlite_conn, path, tier, "update",
+            summary or "Updated page",
+        )
+        return {"path": path, "status": "updated"}
+    except FileNotFoundError:
+        return {"error": f"Page not found: {path}"}
+
+
+@mcp.tool()
+def memory_delete(path: str, reason: str = "") -> dict:
+    """Delete a memory page.
+
+    Drafts (paths under `1_drafts/`) cannot be deleted via this tool — use the
+    curator file-system flow instead. Pages in agent-writable curated carve-outs
+    (e.g. `2_knowledges/preferences/`) are *archived*, not unlinked: the file
+    moves to `<tier>/_archived/<original-rel-path>` so the audit trail survives.
+    """
+    if path.startswith(paths.DRAFTS_PREFIX):
+        return {"error": "Drafts cannot be deleted by agents. Curator removes drafts via the file system."}
+
+    try:
+        if paths.is_archive_redirected_path(path):
+            target = paths.archived_knowledge_path(path)
+            memory.move_page(_config.memory_dir, path, target)
+            tier = memory.get_tier(path) or "knowledge"
+            storage.create_memory_edit(
+                _sqlite_conn, target, tier, "archive",
+                reason or f"Archived from {path}",
+            )
+            search.sync_from_files(_duckdb_conn, _config.memory_dir)
+            return {"path": target, "status": "archived", "from": path}
+
+        memory.delete_page(_config.memory_dir, path)
+        tier = memory.get_tier(path) or "draft"
+        storage.create_memory_edit(_sqlite_conn, path, tier, "delete", reason or "Deleted page")
+
+        if tier in ("knowledge", "skill", "agent"):
+            search.sync_from_files(_duckdb_conn, _config.memory_dir)
+
+        return {"path": path, "status": "deleted"}
+    except FileNotFoundError:
+        return {"error": f"Page not found: {path}"}
+    except FileExistsError:
+        return {"error": f"Archive target already exists for {path}"}
+
+
+# --- Maintenance ---
+
+@mcp.tool()
+def maintain_reindex() -> dict:
+    """Rebuild the DuckDB search index from /memory/knowledge and /memory/skills files."""
+    count = search.sync_from_files(_duckdb_conn, _config.memory_dir)
+    return {"status": "reindexed", "pages_indexed": count}
+
+
+@mcp.tool()
+def maintain_get_stats(stale_days: int = 90) -> dict:
+    """Return structural stats for the memory system.
+
+    Reports orphaned pages, stale pages, page counts per tier, group stats.
+    """
+    stale_cutoff = (datetime.now(timezone.utc) - timedelta(days=stale_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    knowledge_pages = memory.list_pages(_config.memory_dir, "2_knowledges")
+    skill_pages = memory.list_pages(_config.memory_dir, "3_intelligences/skills")
+    agent_pages = memory.list_pages(_config.memory_dir, "3_intelligences/agents")
+    draft_pages = memory.list_pages(_config.memory_dir, "1_drafts")
+
+    stale = []
+    for pages, tier in [
+        (knowledge_pages, "knowledge"),
+        (skill_pages, "skill"),
+        (agent_pages, "agent"),
+    ]:
+        for page_path in pages:
+            full_path = _config.memory_dir / page_path
+            if full_path.exists():
+                mtime = datetime.fromtimestamp(full_path.stat().st_mtime, tz=timezone.utc)
+                if mtime.strftime("%Y-%m-%dT%H:%M:%SZ") < stale_cutoff:
+                    stale.append({"path": page_path, "tier": tier, "last_modified": mtime.isoformat()})
+
+    all_groups = storage.list_groups(_sqlite_conn)
+    open_groups = storage.get_open_groups(_sqlite_conn)
+    orphans = storage.get_orphaned_groups(_sqlite_conn)
+    closed_no_draft = storage.get_closed_no_draft_segments(_sqlite_conn)
+
+    return {
+        "pages": {
+            "knowledge": len(knowledge_pages),
+            "skills": len(skill_pages),
+            "agents": len(agent_pages),
+            "drafts": len(draft_pages),
+        },
+        "stale_pages": stale,
+        "groups": {
+            "total": len(all_groups),
+            "open": len(open_groups),
+            "orphaned": len(orphans),
+            "closed_no_draft_segments": len(closed_no_draft),
+        },
+    }
+
+
+@mcp.tool()
+def maintain_purge(older_than_days: int = 365) -> dict:
+    """Delete archived session drafts older than the retention boundary.
+
+    Will hook into the `1_drafts/_archived/sessions__*.md` flat-file glob. Currently
+    a no-op placeholder that returns 0 — purge automation doesn't exist yet.
+    """
+    return {
+        "purged_drafts": [],
+        "note": "maintain_purge is a no-op until Phase 4 archive flow lands",
+        "older_than_days": older_than_days,
+    }
 
 
 def main():

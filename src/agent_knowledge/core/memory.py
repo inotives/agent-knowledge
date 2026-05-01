@@ -6,16 +6,26 @@ from pathlib import Path
 
 
 def ensure_memory_dirs(memory_dir: Path) -> None:
-    """Create the full /memory folder structure."""
+    """Create the deployed three-tier memory layout (EP-00008).
+
+    Numbered prefixes encode promotion order (1 → 2 → 3); `0_configs/` is the
+    wiki contract, not a tier. Archived drafts live flat-file under
+    `1_drafts/_archived/` (no `sessions/` subfolder). Inside `1_drafts/`,
+    nested numeric prefixes signal the *promotion target* of each draft:
+    `2_knowledges/` / `2_notes/` / `2_researches/` promote to Tier 2;
+    `3_skills/` promotes to Tier 3.
+    """
+    from agent_knowledge.core.paths import DRAFT_STAGING_DIRS
+
     dirs = [
-        memory_dir / "drafts" / "sessions",
-        memory_dir / "drafts" / "knowledge",
-        memory_dir / "drafts" / "reviews",
-        memory_dir / "knowledge" / "entities",
-        memory_dir / "knowledge" / "concepts",
-        memory_dir / "knowledge" / "sources",
-        memory_dir / "skills",
+        memory_dir / "0_configs" / "templates",
+        memory_dir / "0_configs" / "rules",
+        memory_dir / "1_drafts" / "_archived",
+        memory_dir / "2_knowledges",
+        memory_dir / "3_intelligences" / "skills",
+        memory_dir / "3_intelligences" / "agents",
     ]
+    dirs.extend(memory_dir / d for d in DRAFT_STAGING_DIRS)
     for d in dirs:
         d.mkdir(parents=True, exist_ok=True)
 
@@ -80,11 +90,15 @@ def list_pages(memory_dir: Path, subdir: str | None = None) -> list[str]:
 
 
 def get_tier(path: str) -> str | None:
-    """Determine the tier from a page path."""
-    if path.startswith("drafts/"):
+    """Determine the tier label from a page path (EP-00008 layout)."""
+    if path.startswith("1_drafts/"):
         return "draft"
-    if path.startswith("knowledge/"):
+    if path.startswith("2_knowledges/"):
         return "knowledge"
-    if path.startswith("skills/"):
+    if path.startswith("3_intelligences/skills/"):
         return "skill"
+    if path.startswith("3_intelligences/agents/"):
+        return "agent"
+    if path.startswith("0_configs/"):
+        return "config"
     return None
