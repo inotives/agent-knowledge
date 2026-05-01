@@ -17,13 +17,59 @@ class TestSyncAndSearch:
         count = search.sync_from_files(tmp_search, tmp_memory)
         assert count == 7
 
-    def test_sync_excludes_skills_and_agents(self, tmp_memory, tmp_search):
+    def test_sync_indexes_skills_and_agents_under_dedicated_tiers(self, tmp_memory, tmp_search):
+        # EP-00009: skills + agents get indexed under their own tier labels.
+        # memory_search excludes them; skill_search / agent_search filter to them.
         memory.ensure_memory_dirs(tmp_memory)
-        memory.create_page(tmp_memory, "3_intelligences/skills/python-coding/SKILL.md", "# Python Skills\nUse type hints.")
-        memory.create_page(tmp_memory, "3_intelligences/agents/python/dev.md", "# Python Dev Persona\nThorough reviewer.")
+        memory.create_page(tmp_memory, "3_intelligences/skills/engineering/python-coding/SKILL.md", "# Python Skills\nUse type hints.")
+        memory.create_page(tmp_memory, "3_intelligences/agents/engineering/dev.md", "# Python Dev Persona\nThorough reviewer.")
 
         count = search.sync_from_files(tmp_search, tmp_memory)
-        assert count == 0
+        assert count == 2
+
+        skill_results = search.search(tmp_search, "Python", tier="skill")
+        agent_results = search.search(tmp_search, "Python", tier="agent")
+        assert len(skill_results) == 1
+        assert skill_results[0]["path"].endswith("/SKILL.md")
+        assert len(agent_results) == 1
+        assert agent_results[0]["tier"] == "agent"
+
+    def test_sync_skill_walker_indexes_skill_md_only(self, tmp_memory, tmp_search):
+        # SKILL.md only — resources/scripts/tests must NOT be indexed.
+        memory.ensure_memory_dirs(tmp_memory)
+        memory.create_page(tmp_memory, "3_intelligences/skills/eng/foo/SKILL.md", "# Foo\ntop-level skill.")
+        memory.create_page(tmp_memory, "3_intelligences/skills/eng/foo/resources/style-guide.md", "# Style Guide\ndo not index.")
+        memory.create_page(tmp_memory, "3_intelligences/skills/eng/foo/resources/cheatsheet.md", "# Cheatsheet\ndo not index either.")
+
+        search.sync_from_files(tmp_search, tmp_memory)
+        skill_results = search.search(tmp_search, "skill OR guide OR cheatsheet", tier="skill")
+        paths_indexed = {r["path"] for r in skill_results}
+        assert paths_indexed == {"3_intelligences/skills/eng/foo/SKILL.md"}
+
+    def test_sync_skips_archived_intelligences(self, tmp_memory, tmp_search):
+        memory.ensure_memory_dirs(tmp_memory)
+        memory.create_page(tmp_memory, "3_intelligences/skills/eng/live/SKILL.md", "# Live Skill\nactive.")
+        memory.create_page(tmp_memory, "3_intelligences/_archived/skills/eng/dead/SKILL.md", "# Dead Skill\nretired.")
+        memory.create_page(tmp_memory, "3_intelligences/agents/eng/live.md", "# Live Agent\nactive.")
+        memory.create_page(tmp_memory, "3_intelligences/_archived/agents/eng/dead.md", "# Dead Agent\nretired.")
+
+        search.sync_from_files(tmp_search, tmp_memory)
+        all_indexed = {r["path"] for r in search.get_index(tmp_search)}
+        assert "3_intelligences/skills/eng/live/SKILL.md" in all_indexed
+        assert "3_intelligences/agents/eng/live.md" in all_indexed
+        assert not any("_archived" in p for p in all_indexed)
+
+    def test_search_domain_filter(self, tmp_memory, tmp_search):
+        memory.ensure_memory_dirs(tmp_memory)
+        memory.create_page(tmp_memory, "3_intelligences/skills/engineering/foo/SKILL.md", "# Foo\nengineering palindrome detector.")
+        memory.create_page(tmp_memory, "3_intelligences/skills/design/bar/SKILL.md", "# Bar\ndesign palindrome detector.")
+        search.sync_from_files(tmp_search, tmp_memory)
+
+        all_hits = search.search(tmp_search, "palindrome", tier="skill")
+        eng_only = search.search(tmp_search, "palindrome", tier="skill", domain_filter="engineering")
+        assert len(all_hits) == 2
+        assert len(eng_only) == 1
+        assert "/engineering/" in eng_only[0]["path"]
 
     def test_sync_skips_archived_subfolders(self, tmp_memory, tmp_search):
         memory.ensure_memory_dirs(tmp_memory)

@@ -78,6 +78,23 @@ def move_page(memory_dir: Path, src_path: str, dst_path: str) -> Path:
     return dst
 
 
+def list_bundle_companions(memory_dir: Path, bundle_dir: Path, subdir: str) -> list[str]:
+    """List relative paths of files under `<bundle_dir>/<subdir>/` recursively.
+
+    Used by `skill_get` to enumerate `resources/`, `scripts/`, `tests/` inside
+    a skill bundle. Returns paths relative to `memory_dir` so they're directly
+    usable with `memory_read`. Empty list if the subdir doesn't exist.
+    """
+    target = bundle_dir / subdir
+    if not target.exists() or not target.is_dir():
+        return []
+    return sorted(
+        str(p.relative_to(memory_dir))
+        for p in target.rglob("*")
+        if p.is_file()
+    )
+
+
 def list_pages(memory_dir: Path, subdir: str | None = None) -> list[str]:
     """List all .md files under a subdirectory, relative to memory_dir."""
     search_dir = memory_dir / subdir if subdir else memory_dir

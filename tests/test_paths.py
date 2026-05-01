@@ -113,3 +113,112 @@ class TestIndexedTiers:
     def test_skill_and_agent_dirs_exposed(self):
         assert paths.SKILLS_DIR == "3_intelligences/skills"
         assert paths.AGENTS_DIR == "3_intelligences/agents"
+
+
+class TestParseSkillPath:
+    def test_canonical_skill_md_path(self):
+        assert paths.parse_skill_path(
+            "3_intelligences/skills/engineering/python-coding/SKILL.md"
+        ) == ("engineering", "python-coding")
+
+    def test_bundle_dir(self):
+        assert paths.parse_skill_path(
+            "3_intelligences/skills/engineering/python-coding"
+        ) == ("engineering", "python-coding")
+
+    def test_nested_slug(self):
+        assert paths.parse_skill_path(
+            "3_intelligences/skills/architecture/observability_design/SKILL.md"
+        ) == ("architecture", "observability_design")
+
+    @pytest.mark.parametrize("bad_path", [
+        "3_intelligences/skills/SKILL.md",                # no domain
+        "3_intelligences/skills/engineering",             # no slug
+        "3_intelligences/agents/engineering/sre.md",      # wrong tier
+        "2_knowledges/concepts/foo.md",                   # wrong tier
+        "random/path.md",
+    ])
+    def test_malformed_returns_none(self, bad_path):
+        assert paths.parse_skill_path(bad_path) is None
+
+
+class TestParseAgentPath:
+    def test_canonical(self):
+        assert paths.parse_agent_path(
+            "3_intelligences/agents/engineering/sre.md"
+        ) == ("engineering", "sre")
+
+    @pytest.mark.parametrize("bad_path", [
+        "3_intelligences/agents/sre.md",                  # no domain
+        "3_intelligences/agents/engineering/sre",         # missing .md
+        "3_intelligences/skills/engineering/foo.md",      # wrong tier
+        "random/path.md",
+    ])
+    def test_malformed_returns_none(self, bad_path):
+        assert paths.parse_agent_path(bad_path) is None
+
+
+class TestSkillBundleDir:
+    def test_strips_skill_md(self):
+        assert (
+            paths.skill_bundle_dir("3_intelligences/skills/eng/foo/SKILL.md")
+            == "3_intelligences/skills/eng/foo"
+        )
+
+    def test_bundle_dir_unchanged(self):
+        assert (
+            paths.skill_bundle_dir("3_intelligences/skills/eng/foo")
+            == "3_intelligences/skills/eng/foo"
+        )
+
+    def test_strips_trailing_slash(self):
+        assert (
+            paths.skill_bundle_dir("3_intelligences/skills/eng/foo/")
+            == "3_intelligences/skills/eng/foo"
+        )
+
+
+class TestResolveSkillPath:
+    def test_full_path_pass_through(self):
+        full = "3_intelligences/skills/eng/foo/SKILL.md"
+        assert paths.resolve_skill_path(full) == full
+
+    def test_bundle_dir_completes_to_skill_md(self):
+        assert (
+            paths.resolve_skill_path("3_intelligences/skills/eng/foo")
+            == "3_intelligences/skills/eng/foo/SKILL.md"
+        )
+
+    def test_shorthand(self):
+        assert (
+            paths.resolve_skill_path("eng/foo")
+            == "3_intelligences/skills/eng/foo/SKILL.md"
+        )
+
+
+class TestResolveAgentPath:
+    def test_full_path_pass_through(self):
+        full = "3_intelligences/agents/eng/sre.md"
+        assert paths.resolve_agent_path(full) == full
+
+    def test_full_path_without_md(self):
+        assert (
+            paths.resolve_agent_path("3_intelligences/agents/eng/sre")
+            == "3_intelligences/agents/eng/sre.md"
+        )
+
+    def test_shorthand(self):
+        assert (
+            paths.resolve_agent_path("eng/sre")
+            == "3_intelligences/agents/eng/sre.md"
+        )
+
+
+class TestIntelligencesTiers:
+    def test_covers_skill_and_agent(self):
+        labels = {label for label, _, _ in paths.INTELLIGENCES_TIERS}
+        assert labels == {"skill", "agent"}
+
+    def test_skill_walks_skill_md_only(self):
+        skill = next(t for t in paths.INTELLIGENCES_TIERS if t[0] == "skill")
+        assert skill == ("skill", paths.SKILLS_DIR, paths.SKILL_ENTRY_FILENAME)

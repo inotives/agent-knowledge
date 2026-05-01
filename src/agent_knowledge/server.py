@@ -80,7 +80,14 @@ mcp = FastMCP(
         "Call `memory_delete` and the server moves the file for you.\n\n"
         "DRAFT POLICY: Agents create and append to `1_drafts/`. Agents must NEVER delete "
         "drafts and must NEVER write to `1_drafts/_archived/` — archiving is a curator action via "
-        "`akw archive` or manual move."
+        "`akw archive` or manual move.\n\n"
+        "DISCOVERY TOOLS: `memory_search` covers drafts and curated knowledge but NOT skills "
+        "or agent personas. Use `skill_search(query, domain=)` when looking up a capability "
+        "to equip (\"how do I X?\"); pair with `skill_get(<path-or-domain/slug>)` to fetch the "
+        "SKILL.md plus a manifest of resource/script/test files (read companions on demand "
+        "via `memory_read`). Use `agent_search` + `agent_get` when assigning a role to a "
+        "subagent (\"you are X\"). Both `*_search` tools accept an optional `domain` filter "
+        "to scope BM25 ranking within a single domain."
     ),
 )
 
@@ -415,6 +422,9 @@ def group_log(
 
 # --- Memory Read ---
 
+_INTELLIGENCES_TIER_LABELS = ("skill", "agent")
+
+
 @mcp.tool()
 def memory_search(query: str, tier: str | None = None) -> list[dict]:
     """Search drafts and curated knowledge by query (BM25).
@@ -424,9 +434,14 @@ def memory_search(query: str, tier: str | None = None) -> list[dict]:
     for an all-tier search.
 
     Skills (`3_intelligences/skills/`) and agent personas (`3_intelligences/agents/`)
-    are intentionally NOT in this index — they have dedicated discovery tools.
+    have dedicated discovery tools — use `skill_search` / `agent_search` instead.
     """
-    return search.search(_duckdb_conn, query, tier)
+    if tier in _INTELLIGENCES_TIER_LABELS:
+        return [{"error": f"Use {tier}_search for the {tier} tier — it ranks differently and returns bundle context."}]
+    results = search.search(_duckdb_conn, query, tier)
+    if tier is None:
+        results = [r for r in results if r["tier"] not in _INTELLIGENCES_TIER_LABELS]
+    return results
 
 
 @mcp.tool()
@@ -437,6 +452,122 @@ def memory_read(path: str) -> dict:
         return {"path": path, "content": content}
     except FileNotFoundError:
         return {"error": f"Page not found: {path}"}
+
+
+# --- Intelligences discovery (EP-00009) ---
+
+@mcp.tool()
+def skill_search(query: str, domain: str | None = None) -> list[dict]:
+    """Search the skill bundles by query (BM25).
+
+    Use this when EQUIPPING a capability — the agent knows the *kind* of work
+    and wants to find a matching skill ("how do I X?"). Returns ranked
+    `SKILL.md` paths; one row per bundle. Resources / scripts / tests within a
+    bundle are NOT searchable on their own — pull them via `skill_get` and
+    `memory_read` after equipping.
+
+    Args:
+        query: BM25 query string.
+        domain: Optional domain filter — first path segment after `skills/`
+            (e.g. `engineering`, `design`, `product`). Pre-filters before BM25
+            so ranking happens within the scoped subset.
+    """
+    return search.search(_duckdb_conn, query, tier="skill", domain_filter=domain)
+
+
+@mcp.tool()
+def skill_get(skill_path: str) -> dict:
+    """Return a skill bundle's `SKILL.md` content + manifest of companions.
+
+    Resource / script / test paths are listed but NOT inlined — bundles can be
+    large; the agent reads what it needs via `memory_read` lazily. Mirrors how
+    skill systems load capabilities.
+
+    Args:
+        skill_path: Either the full path (e.g. `3_intelligences/skills/engineering/python-coding/SKILL.md`)
+            or the `<domain>/<slug>` shorthand (e.g. `engineering/python-coding`).
+
+    Returns: `{path, domain, slug, title, content, resources[], scripts[], tests[]}`.
+    """
+    canonical = paths.resolve_skill_path(skill_path)
+    parsed = paths.parse_skill_path(canonical)
+    if parsed is None:
+        return {"error": f"Not a valid skill path: {skill_path}"}
+    domain, slug = parsed
+
+    try:
+        content = memory.read_page(_config.memory_dir, canonical)
+    except FileNotFoundError:
+        return {"error": f"Skill not found: {canonical}"}
+
+    bundle_dir = _config.memory_dir / paths.skill_bundle_dir(canonical)
+    title = _first_heading(content) or slug
+    return {
+        "path": canonical,
+        "domain": domain,
+        "slug": slug,
+        "title": title,
+        "content": content,
+        "resources": memory.list_bundle_companions(_config.memory_dir, bundle_dir, "resources"),
+        "scripts": memory.list_bundle_companions(_config.memory_dir, bundle_dir, "scripts"),
+        "tests": memory.list_bundle_companions(_config.memory_dir, bundle_dir, "tests"),
+    }
+
+
+@mcp.tool()
+def agent_search(query: str, domain: str | None = None) -> list[dict]:
+    """Search agent personas by query (BM25).
+
+    Use this when ASSIGNING A ROLE — the agent (or orchestrator) needs a
+    persona for a subtask ("you are X"). Returns ranked persona paths.
+
+    Args:
+        query: BM25 query string.
+        domain: Optional domain filter — first path segment after `agents/`
+            (e.g. `engineering`, `design`, `testing`).
+    """
+    return search.search(_duckdb_conn, query, tier="agent", domain_filter=domain)
+
+
+@mcp.tool()
+def agent_get(agent_path: str) -> dict:
+    """Return an agent persona file's full content + parsed metadata.
+
+    Personas are single-file and small enough to inline directly.
+
+    Args:
+        agent_path: Either the full path (e.g. `3_intelligences/agents/engineering/sre.md`)
+            or the `<domain>/<slug>` shorthand (e.g. `engineering/sre`).
+
+    Returns: `{path, domain, slug, title, content}`.
+    """
+    canonical = paths.resolve_agent_path(agent_path)
+    parsed = paths.parse_agent_path(canonical)
+    if parsed is None:
+        return {"error": f"Not a valid agent path: {agent_path}"}
+    domain, slug = parsed
+
+    try:
+        content = memory.read_page(_config.memory_dir, canonical)
+    except FileNotFoundError:
+        return {"error": f"Agent not found: {canonical}"}
+
+    title = _first_heading(content) or slug
+    return {
+        "path": canonical,
+        "domain": domain,
+        "slug": slug,
+        "title": title,
+        "content": content,
+    }
+
+
+def _first_heading(content: str) -> str | None:
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("# "):
+            return stripped[2:].strip()
+    return None
 
 
 @mcp.tool()

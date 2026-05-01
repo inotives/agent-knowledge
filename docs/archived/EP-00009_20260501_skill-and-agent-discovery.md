@@ -81,38 +81,38 @@ Pre-filter rather than post-filter so BM25 ranks within the scoped subset (more 
 ## Implementation Phases
 
 ### Phase 1 — Path helpers
-- [ ] `paths.py`: add `SKILL_ENTRY_FILENAME = "SKILL.md"`.
-- [ ] `paths.py`: helpers `parse_skill_path(path) -> (domain, slug)` and `parse_agent_path(path) -> (domain, slug)`. Return `None` if the path doesn't fit the expected shape.
-- [ ] `paths.py`: helper `skill_bundle_dir(skill_path) -> str` (the directory containing `SKILL.md`).
-- [ ] Tests in `test_paths.py` cover happy paths and malformed inputs.
+- [x] `paths.py`: add `SKILL_ENTRY_FILENAME = "SKILL.md"`.
+- [x] `paths.py`: helpers `parse_skill_path(path) -> (domain, slug)` and `parse_agent_path(path) -> (domain, slug)`. Return `None` if the path doesn't fit the expected shape.
+- [x] `paths.py`: helper `skill_bundle_dir(skill_path) -> str` (the directory containing `SKILL.md`).
+- [x] Tests in `test_paths.py` cover happy paths and malformed inputs.
 
 ### Phase 2 — Index walker
-- [ ] `search.py`: add `sync_intelligences(conn, memory_dir)` that walks `3_intelligences/skills/**/SKILL.md` (tier `skill`) and `3_intelligences/agents/**/*.md` (tier `agent`), skipping any `_archived/` subfolder.
-- [ ] Wire `sync_intelligences` into `sync_from_files` so a single connect rebuilds everything.
-- [ ] `search.py`: add `domain_filter` kwarg to `search()` — applies an extra `path LIKE ?` predicate prefixed by the tier root + domain.
-- [ ] `paths.py`: surface `INTELLIGENCES_TIERS = (("skill", SKILLS_DIR, SKILL_ENTRY_FILENAME), ("agent", AGENTS_DIR, "*.md"))` so the walker has one source of truth.
+- [x] `search.py`: add `sync_intelligences(conn, memory_dir)` that walks `3_intelligences/skills/**/SKILL.md` (tier `skill`) and `3_intelligences/agents/**/*.md` (tier `agent`), skipping any `_archived/` subfolder.
+- [x] Wire `sync_intelligences` into `sync_from_files` so a single connect rebuilds everything.
+- [x] `search.py`: add `domain_filter` kwarg to `search()` — applies an extra `path LIKE ?` predicate prefixed by the tier root + domain.
+- [x] `paths.py`: surface `INTELLIGENCES_TIERS = (("skill", SKILLS_DIR, SKILL_ENTRY_FILENAME), ("agent", AGENTS_DIR, "*.md"))` so the walker has one source of truth.
 
 ### Phase 3 — MCP tools
-- [ ] `server.py`: `@mcp.tool() skill_search(query, domain=None) -> list[dict]`.
-- [ ] `server.py`: `@mcp.tool() skill_get(skill_path) -> dict` — reads the file, builds the manifest from sibling directories.
-- [ ] `server.py`: `@mcp.tool() agent_search(query, domain=None) -> list[dict]`.
-- [ ] `server.py`: `@mcp.tool() agent_get(agent_path) -> dict`.
-- [ ] Tool docstrings clearly distinguish from `memory_search` ("use when equipping a capability / assigning a role"). Update the server `instructions` block to mention the new tools and when to use them.
+- [x] `server.py`: `@mcp.tool() skill_search(query, domain=None) -> list[dict]`.
+- [x] `server.py`: `@mcp.tool() skill_get(skill_path) -> dict` — reads the file, builds the manifest from sibling directories.
+- [x] `server.py`: `@mcp.tool() agent_search(query, domain=None) -> list[dict]`.
+- [x] `server.py`: `@mcp.tool() agent_get(agent_path) -> dict`.
+- [x] Tool docstrings clearly distinguish from `memory_search` ("use when equipping a capability / assigning a role"). Update the server `instructions` block to mention the new tools and when to use them.
 
 ### Phase 4 — CLI helpers (optional, for parity with `akw search`)
-- [ ] `akw skill search <query> [--domain D]` — print ranked bundle paths.
-- [ ] `akw skill show <skill_path>` — print SKILL.md + manifest summary.
-- [ ] `akw agent search <query> [--domain D]` — print ranked persona paths.
-- [ ] `akw agent show <agent_path>` — print persona content.
+- [x] `akw skill search <query> [--domain D]` — print ranked bundle paths.
+- [x] `akw skill show <skill_path>` — print SKILL.md + manifest summary.
+- [x] `akw agent search <query> [--domain D]` — print ranked persona paths.
+- [x] `akw agent show <agent_path>` — print persona content.
 
 ### Phase 5 — Tests
-- [ ] `test_paths.py`: `parse_skill_path`, `parse_agent_path`, `skill_bundle_dir` round-trips.
-- [ ] `test_search.py`: skill walker indexes `SKILL.md` only (does NOT pick up `resources/*.md`).
-- [ ] `test_search.py`: agent walker picks up `*.md` under `agents/<domain>/`.
-- [ ] `test_search.py`: `_archived/` subfolders skipped for both walkers.
-- [ ] `test_search.py`: `domain_filter` scopes results to a single domain.
-- [ ] New `test_intelligences.py` (or add to `test_search.py`): `skill_get` returns manifest with correct `resources` / `scripts` / `tests` keys; missing companion dirs return empty arrays without erroring.
-- [ ] Live sanity check on the deployed memory: 216 skills + 59 agents indexed, search returns sensible top-K for known terms.
+- [x] `test_paths.py`: `parse_skill_path`, `parse_agent_path`, `skill_bundle_dir` round-trips.
+- [x] `test_search.py`: skill walker indexes `SKILL.md` only (does NOT pick up `resources/*.md`).
+- [x] `test_search.py`: agent walker picks up `*.md` under `agents/<domain>/`.
+- [x] `test_search.py`: `_archived/` subfolders skipped for both walkers.
+- [x] `test_search.py`: `domain_filter` scopes results to a single domain.
+- [x] New `test_intelligences.py` (or add to `test_search.py`): `skill_get` returns manifest with correct `resources` / `scripts` / `tests` keys; missing companion dirs return empty arrays without erroring.
+- [x] Live sanity check on the deployed memory: 216 skills + 59 agents indexed, search returns sensible top-K for known terms.
 
 ## Out of Scope
 
@@ -128,4 +128,6 @@ Pre-filter rather than post-filter so BM25 ranks within the scoped subset (more 
 2. **CLI parity (Phase 4):** ship as thin wrappers around the existing `akw search` function. `akw skill search` delegates to `search_cmd(query, tier="skill", domain=...)`, `akw agent search` to the same with `tier="agent"`. `akw skill show` / `akw agent show` reuse `memory_read` + manifest building. Reuses existing infrastructure rather than duplicating it.
 3. **Manifest depth:** `skill_get` lists `resources/`, `scripts/`, `tests/` recursively via `rglob` so nested subdirs surface.
 
-## Status: IN PROGRESS
+## Status: DONE
+
+Implementation landed on `feat/ep-00009-skill-and-agent-discovery`. 117 tests passing (including new `test_intelligences.py` for the `list_bundle_companions` helper + CLI smoke). Live-tested via deployed memory: `akw skill search "incident response"` returns ranked bundles across `workflow/` domain; `akw agent search "code review" --domain engineering` returns 5 engineering agents; `akw skill show workflow/incident_commander` prints SKILL.md and lists the bundle's `scripts/`. MCP tools awaiting `/mcp` reconnect for live verification.
