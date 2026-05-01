@@ -200,9 +200,9 @@ Curator-only. The MCP rejects writes here.
 │  Storage & Search                                        │
 │  - SQLite: groups, turns, memory_edits, draft_state      │
 │  - DuckDB: full-text search                              │
-│      indexed: knowledge + drafts (sessions, knowledge,   │
-│               notes, researches, skill drafts)           │
-│      excluded: skills/agents (dedicated tools — Phase B) │
+│      memory_search:  knowledge + drafts                  │
+│      skill_search:   3_intelligences/skills (SKILL.md)   │
+│      agent_search:   3_intelligences/agents              │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -289,9 +289,11 @@ DuckDB runs as an in-memory connection (no file lock contention across concurren
 - `1_drafts/2_researches/**` → tier `research_draft`
 - `1_drafts/3_skills/**` → tier `skill_draft`
 
-**Excluded** (Phase B — dedicated discovery tools):
-- `3_intelligences/skills/**` — invoked when an agent equips a skill
-- `3_intelligences/agents/**` — invoked when assigning an agent persona
+**Indexed under dedicated tier labels** (EP-00009 — accessed via `skill_search` / `agent_search`, not `memory_search`):
+- `3_intelligences/skills/**/SKILL.md` → tier `skill` (one row per bundle; resources/scripts/tests are NOT indexed but listed in `skill_get` manifest)
+- `3_intelligences/agents/**/*.md` → tier `agent`
+
+`memory_search` filters skills/agents out of its default results so exploratory text search across knowledge stays focused. Use the dedicated tools for capability discovery.
 
 Vector search (embeddings) is a future addition — BM25 is sufficient to start and avoids an embedding model dependency.
 
@@ -353,10 +355,21 @@ The server exposes these tools to connected agents:
 
 | Tool | Description |
 |---|---|
-| `memory_search` | Search drafts and curated knowledge by BM25. Tiers: `knowledge`, `session_draft`, `session_archived`, `knowledge_draft`, `note_draft`, `research_draft`, `skill_draft`. Skills (`3_intelligences/skills/`) and agent personas are intentionally excluded — they have dedicated discovery tools (Phase B). Params: `query` (string), `tier` (optional filter). |
+| `memory_search` | Search drafts and curated knowledge by BM25. Tiers: `knowledge`, `session_draft`, `session_archived`, `knowledge_draft`, `note_draft`, `research_draft`, `skill_draft`. Skills and agent personas have dedicated tools — passing `tier='skill'`/`'agent'` returns a redirect hint. Params: `query`, `tier` (optional). |
 | `memory_read` | Read a specific page. Params: `path` (relative to `/memory`). |
 | `memory_index` | Return a catalog of indexed pages, queried from DuckDB. Params: `tier` (optional). Returns page paths, titles, summaries. |
 | `memory_history` | Return recent edit history from the audit log. Params: `limit` (int, default 20), `page_path` (optional, filter by page). |
+
+### Intelligences — Discovery (EP-00009)
+
+Use these when looking up a *capability* to equip or a *role* to assign. They run on the same DuckDB table but stay partitioned from `memory_search` by tier label.
+
+| Tool | Description |
+|---|---|
+| `skill_search` | Search SKILL.md files by query (BM25). One row per bundle. Resources/scripts within a bundle are NOT searchable on their own. Params: `query`, `domain` (optional, e.g. `engineering` — pre-filters before BM25). |
+| `skill_get` | Return SKILL.md content + manifest of `resources/`, `scripts/`, `tests/` files (paths only, recursive). Resources are read on demand via `memory_read`. Param: `skill_path` — full path or `<domain>/<slug>` shorthand. |
+| `agent_search` | Search agent persona files by query (BM25). Params: `query`, `domain` (optional). |
+| `agent_get` | Return persona file content + parsed metadata. Param: `agent_path` — full path or `<domain>/<slug>` shorthand. |
 
 ### Memory — Write
 
@@ -432,6 +445,10 @@ akw <command> [options]
 |---|---|
 | `akw groups [--project X]` | List recent groups with summaries. For quick inspection without opening an agent. |
 | `akw search "query" [--tier T]` | Search memory from the terminal. Returns ranked results. |
+| `akw skill search "query" [--domain D]` | Search skill bundles. Thin wrapper around `akw search --tier=skill` with a domain pre-filter. |
+| `akw skill show <path or domain/slug>` | Print SKILL.md + a list of `resources/`, `scripts/`, `tests/` companions. |
+| `akw agent search "query" [--domain D]` | Search agent personas. |
+| `akw agent show <path or domain/slug>` | Print persona file content. |
 
 ### Design Principle
 

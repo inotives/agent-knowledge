@@ -32,6 +32,17 @@ DRAFT_STAGING_DIRS = (
 
 SKILLS_DIR = "3_intelligences/skills"
 AGENTS_DIR = "3_intelligences/agents"
+SKILL_ENTRY_FILENAME = "SKILL.md"
+
+# Tiers indexed for the dedicated discovery tools (EP-00009). Each entry:
+#   (tier_label, root_dir, file_or_glob_to_walk)
+# `SKILL.md` for skills (one row per bundle, `resources/`/`scripts/`/`tests/` are NOT
+# searchable but surface in `skill_get` manifest); any `*.md` for agents (single-file
+# personas).
+INTELLIGENCES_TIERS = (
+    ("skill", SKILLS_DIR, SKILL_ENTRY_FILENAME),
+    ("agent", AGENTS_DIR, "*.md"),
+)
 
 WRITE_BLOCKED_PREFIXES = (
     "2_knowledges/",
@@ -127,6 +138,87 @@ def is_archive_redirected_path(path: str) -> bool:
         if path.startswith(override):
             return True
     return False
+
+
+def parse_skill_path(path: str) -> tuple[str, str] | None:
+    """Extract `(domain, slug)` from a skill bundle path.
+
+    Accepts the canonical SKILL.md path or the bundle dir:
+      `3_intelligences/skills/engineering/python-coding/SKILL.md` → `("engineering", "python-coding")`
+      `3_intelligences/skills/engineering/python-coding`         → `("engineering", "python-coding")`
+
+    Returns `None` if the path isn't shaped like a skill bundle.
+    """
+    if not path.startswith(f"{SKILLS_DIR}/"):
+        return None
+    rest = path[len(SKILLS_DIR) + 1:].rstrip("/")
+    if rest.endswith(f"/{SKILL_ENTRY_FILENAME}"):
+        rest = rest[: -len(SKILL_ENTRY_FILENAME) - 1]
+    parts = rest.split("/")
+    if len(parts) < 2:
+        return None
+    domain = parts[0]
+    slug = "/".join(parts[1:])
+    if not domain or not slug:
+        return None
+    return domain, slug
+
+
+def parse_agent_path(path: str) -> tuple[str, str] | None:
+    """Extract `(domain, slug)` from an agent persona path.
+
+    `3_intelligences/agents/engineering/sre.md` → `("engineering", "sre")`.
+
+    Returns `None` for malformed paths.
+    """
+    if not path.startswith(f"{AGENTS_DIR}/"):
+        return None
+    rest = path[len(AGENTS_DIR) + 1:]
+    if not rest.endswith(".md"):
+        return None
+    parts = rest[: -len(".md")].split("/")
+    if len(parts) < 2:
+        return None
+    domain = parts[0]
+    slug = "/".join(parts[1:])
+    if not domain or not slug:
+        return None
+    return domain, slug
+
+
+def skill_bundle_dir(skill_path: str) -> str:
+    """Directory containing `SKILL.md` for a bundle.
+
+    `3_intelligences/skills/engineering/python-coding/SKILL.md`
+        → `3_intelligences/skills/engineering/python-coding`.
+
+    Accepts the bundle directory itself unchanged.
+    """
+    if skill_path.endswith(f"/{SKILL_ENTRY_FILENAME}"):
+        return skill_path[: -len(SKILL_ENTRY_FILENAME) - 1]
+    return skill_path.rstrip("/")
+
+
+def resolve_skill_path(arg: str) -> str:
+    """Resolve a skill_get argument to a canonical SKILL.md path.
+
+    Accepts either the full path (with or without `/SKILL.md` suffix) or
+    `<domain>/<slug>` shorthand. Returns the canonical SKILL.md path.
+    """
+    if arg.startswith(f"{SKILLS_DIR}/"):
+        bundle = skill_bundle_dir(arg)
+        return f"{bundle}/{SKILL_ENTRY_FILENAME}"
+    return f"{SKILLS_DIR}/{arg.rstrip('/')}/{SKILL_ENTRY_FILENAME}"
+
+
+def resolve_agent_path(arg: str) -> str:
+    """Resolve an agent_get argument to a canonical persona path.
+
+    Accepts either the full path (with `.md`) or `<domain>/<slug>` shorthand.
+    """
+    if arg.startswith(f"{AGENTS_DIR}/"):
+        return arg if arg.endswith(".md") else f"{arg}.md"
+    return f"{AGENTS_DIR}/{arg.rstrip('/')}.md"
 
 
 def archived_knowledge_path(path: str) -> str:

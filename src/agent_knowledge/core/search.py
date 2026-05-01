@@ -40,12 +40,14 @@ def _ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
 
 
 def sync_from_files(conn: duckdb.DuckDBPyConnection, memory_dir: Path) -> int:
-    """Rebuild the search index from every indexed tier (EP-00008).
+    """Rebuild the search index from every indexed tier (EP-00008 + EP-00009).
 
-    Walks each `(tier, subdir)` in `paths.INDEXED_TIERS` recursively, skipping
-    any `_archived/` subfolder so archived pages don't pollute live-tier results.
-    Archived sessions are picked up separately via `ARCHIVED_SESSION_GLOB` and
-    labelled with the dedicated `session_archived` tier.
+    Walks each `(tier, subdir)` in `paths.INDEXED_TIERS` recursively, skipping any
+    `_archived/` subfolder so archived pages don't pollute live-tier results.
+    Archived sessions are picked up via `ARCHIVED_SESSION_GLOB`. Skills and
+    agents are walked separately under their dedicated tiers (`skill`, `agent`)
+    via `paths.INTELLIGENCES_TIERS` — they share the index table but stay
+    excluded from `memory_search` results unless explicitly requested.
 
     Returns the number of pages indexed.
     """
@@ -64,7 +66,28 @@ def sync_from_files(conn: duckdb.DuckDBPyConnection, memory_dir: Path) -> int:
     for md_file in memory_dir.glob(paths.ARCHIVED_SESSION_GLOB):
         count += _index_file(conn, memory_dir, md_file, paths.ARCHIVED_SESSION_TIER)
 
+    count += _sync_intelligences(conn, memory_dir)
+
     _rebuild_fts(conn)
+    return count
+
+
+def _sync_intelligences(conn: duckdb.DuckDBPyConnection, memory_dir: Path) -> int:
+    """Index skills (SKILL.md only) and agents (single-file personas) — EP-00009.
+
+    Skills walker uses `rglob(SKILL_ENTRY_FILENAME)` so each bundle yields exactly
+    one row regardless of how many resources/scripts it ships. Agents walker uses
+    `rglob('*.md')` since personas are flat. Both skip `_archived/` subfolders.
+    """
+    count = 0
+    for tier_name, subdir, walker_glob in paths.INTELLIGENCES_TIERS:
+        tier_dir = memory_dir / subdir
+        if not tier_dir.exists():
+            continue
+        for md_file in tier_dir.rglob(walker_glob):
+            if "_archived" in md_file.relative_to(tier_dir).parts:
+                continue
+            count += _index_file(conn, memory_dir, md_file, tier_name)
     return count
 
 
@@ -95,8 +118,15 @@ def search(
     conn: duckdb.DuckDBPyConnection,
     query: str,
     tier: str | None = None,
+    domain_filter: str | None = None,
 ) -> list[dict]:
-    """Search indexed pages using BM25. Returns ranked results."""
+    """Search indexed pages using BM25. Returns ranked results.
+
+    `domain_filter` (EP-00009) scopes results to a single domain segment within
+    the tier — e.g. `tier='skill', domain_filter='engineering'` only matches
+    `3_intelligences/skills/engineering/...`. Applied as a path-prefix predicate
+    so BM25 ranks within the scoped subset.
+    """
     if not query.strip():
         return []
 
@@ -114,6 +144,12 @@ def search(
         sql += " AND tier = ?"
         params.append(tier)
 
+    if domain_filter and tier:
+        prefix = _domain_prefix(tier, domain_filter)
+        if prefix:
+            sql += " AND path LIKE ?"
+            params.append(f"{prefix}%")
+
     sql += " ORDER BY score DESC"
 
     rows = conn.execute(sql, params).fetchall()
@@ -121,6 +157,19 @@ def search(
         {"path": r[0], "title": r[1], "summary": r[2], "tier": r[3], "score": r[4]}
         for r in rows
     ]
+
+
+def _domain_prefix(tier: str, domain: str) -> str | None:
+    """Build the path prefix for a `(tier, domain)` filter.
+
+    Only meaningful for skill/agent tiers — returns None otherwise so the
+    domain predicate is silently dropped (general tiers don't have domains).
+    """
+    if tier == "skill":
+        return f"{paths.SKILLS_DIR}/{domain}/"
+    if tier == "agent":
+        return f"{paths.AGENTS_DIR}/{domain}/"
+    return None
 
 
 def get_index(

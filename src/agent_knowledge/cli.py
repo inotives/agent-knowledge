@@ -96,11 +96,8 @@ def status():
     conn.close()
 
 
-@main.command("search")
-@click.argument("query")
-@click.option("--tier", "-t", default=None, help="Filter by tier: knowledge, skill, agent, session_draft, session_archived.")
-def search_cmd(query: str, tier: str | None):
-    """Search memory from the terminal."""
+def _run_search(query: str, tier: str | None, domain: str | None = None) -> None:
+    """Shared search runner — used by `akw search` and the skill/agent CLI wrappers."""
     config = load_config()
     if not config.memory_dir.exists():
         click.echo("Memory folder not initialized. Run 'akw init' first.")
@@ -109,7 +106,7 @@ def search_cmd(query: str, tier: str | None):
     duckdb_conn = search.connect(config.search_db)
     search.sync_from_files(duckdb_conn, config.memory_dir)
 
-    results = search.search(duckdb_conn, query, tier)
+    results = search.search(duckdb_conn, query, tier, domain_filter=domain)
     if not results:
         click.echo("No results found.")
         duckdb_conn.close()
@@ -122,6 +119,98 @@ def search_cmd(query: str, tier: str | None):
 
     click.echo(f"\n{len(results)} results.")
     duckdb_conn.close()
+
+
+@main.command("search")
+@click.argument("query")
+@click.option("--tier", "-t", default=None, help="Filter by tier: knowledge, skill, agent, session_draft, session_archived.")
+def search_cmd(query: str, tier: str | None):
+    """Search memory from the terminal."""
+    _run_search(query, tier)
+
+
+# --- skill / agent discovery (EP-00009) ---
+
+@main.group()
+def skill():
+    """Skill bundle discovery commands."""
+
+
+main.add_command(skill)
+
+
+@skill.command("search")
+@click.argument("query")
+@click.option("--domain", "-d", default=None, help="Limit to a single domain (e.g. engineering, design).")
+def skill_search_cmd(query: str, domain: str | None):
+    """Search skill bundles by query."""
+    _run_search(query, tier="skill", domain=domain)
+
+
+@skill.command("show")
+@click.argument("skill_arg")
+def skill_show_cmd(skill_arg: str):
+    """Print SKILL.md content + bundle manifest. Accepts full path or <domain>/<slug>."""
+    config = load_config()
+    canonical = paths.resolve_skill_path(skill_arg)
+    parsed = paths.parse_skill_path(canonical)
+    if parsed is None:
+        click.echo(f"Not a valid skill path: {skill_arg}", err=True)
+        raise SystemExit(1)
+    domain, slug = parsed
+
+    full = config.memory_dir / canonical
+    if not full.exists():
+        click.echo(f"Skill not found: {canonical}", err=True)
+        raise SystemExit(1)
+
+    bundle_dir = config.memory_dir / paths.skill_bundle_dir(canonical)
+    click.echo(f"# {domain}/{slug}\n")
+    click.echo(full.read_text(encoding="utf-8"))
+
+    for label in ("resources", "scripts", "tests"):
+        items = memory.list_bundle_companions(config.memory_dir, bundle_dir, label)
+        if items:
+            click.echo(f"\n## {label}/")
+            for p in items:
+                click.echo(f"  {p}")
+
+
+@main.group()
+def agent():
+    """Agent persona discovery commands."""
+
+
+main.add_command(agent)
+
+
+@agent.command("search")
+@click.argument("query")
+@click.option("--domain", "-d", default=None, help="Limit to a single domain (e.g. engineering, design).")
+def agent_search_cmd(query: str, domain: str | None):
+    """Search agent personas by query."""
+    _run_search(query, tier="agent", domain=domain)
+
+
+@agent.command("show")
+@click.argument("agent_arg")
+def agent_show_cmd(agent_arg: str):
+    """Print agent persona file. Accepts full path or <domain>/<slug>."""
+    config = load_config()
+    canonical = paths.resolve_agent_path(agent_arg)
+    parsed = paths.parse_agent_path(canonical)
+    if parsed is None:
+        click.echo(f"Not a valid agent path: {agent_arg}", err=True)
+        raise SystemExit(1)
+    domain, slug = parsed
+
+    full = config.memory_dir / canonical
+    if not full.exists():
+        click.echo(f"Agent not found: {canonical}", err=True)
+        raise SystemExit(1)
+
+    click.echo(f"# {domain}/{slug}\n")
+    click.echo(full.read_text(encoding="utf-8"))
 
 
 @main.command()
