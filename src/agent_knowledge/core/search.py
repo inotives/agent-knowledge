@@ -1,4 +1,4 @@
-"""DuckDB search index — BM25 full-text search on knowledge + skills."""
+"""DuckDB search index — BM25 full-text search across all indexed tiers (EP-00008)."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
+
+from agent_knowledge.core import paths
 
 
 def connect(db_path: Path) -> duckdb.DuckDBPyConnection:
@@ -38,37 +40,55 @@ def _ensure_schema(conn: duckdb.DuckDBPyConnection) -> None:
 
 
 def sync_from_files(conn: duckdb.DuckDBPyConnection, memory_dir: Path) -> int:
-    """Rebuild the search index from knowledge + skills markdown files.
+    """Rebuild the search index from every indexed tier (EP-00008).
+
+    Walks each `(tier, subdir)` in `paths.INDEXED_TIERS` recursively, skipping
+    any `_archived/` subfolder so archived pages don't pollute live-tier results.
+    Archived sessions are picked up separately via `ARCHIVED_SESSION_GLOB` and
+    labelled with the dedicated `session_archived` tier.
 
     Returns the number of pages indexed.
     """
     conn.execute("DELETE FROM memory_pages")
 
     count = 0
-    for tier_name, subdir in [("knowledge", "knowledge"), ("skill", "skills")]:
+    for tier_name, subdir in paths.INDEXED_TIERS:
         tier_dir = memory_dir / subdir
         if not tier_dir.exists():
             continue
         for md_file in tier_dir.rglob("*.md"):
-            content = md_file.read_text(encoding="utf-8")
-            rel_path = str(md_file.relative_to(memory_dir))
-            title = _extract_title(content, md_file.stem)
-            summary = _extract_summary(content)
-            tags = _extract_tags(content)
-            updated_at = md_file.stat().st_mtime
+            if "_archived" in md_file.relative_to(tier_dir).parts:
+                continue
+            count += _index_file(conn, memory_dir, md_file, tier_name)
 
-            updated_at_str = datetime.fromtimestamp(updated_at, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-            conn.execute(
-                """INSERT OR REPLACE INTO memory_pages
-                (path, title, content, summary, tags, tier, updated_at, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?, '{}')""",
-                (rel_path, title, content, summary, tags, tier_name, updated_at_str),
-            )
-            count += 1
+    for md_file in memory_dir.glob(paths.ARCHIVED_SESSION_GLOB):
+        count += _index_file(conn, memory_dir, md_file, paths.ARCHIVED_SESSION_TIER)
 
     _rebuild_fts(conn)
     return count
+
+
+def _index_file(
+    conn: duckdb.DuckDBPyConnection,
+    memory_dir: Path,
+    md_file: Path,
+    tier_name: str,
+) -> int:
+    content = md_file.read_text(encoding="utf-8")
+    rel_path = str(md_file.relative_to(memory_dir))
+    title = _extract_title(content, md_file.stem)
+    summary = _extract_summary(content)
+    tags = _extract_tags(content)
+    updated_at = md_file.stat().st_mtime
+    updated_at_str = datetime.fromtimestamp(updated_at, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    conn.execute(
+        """INSERT OR REPLACE INTO memory_pages
+        (path, title, content, summary, tags, tier, updated_at, metadata)
+        VALUES (?, ?, ?, ?, ?, ?, ?, '{}')""",
+        (rel_path, title, content, summary, tags, tier_name, updated_at_str),
+    )
+    return 1
 
 
 def search(

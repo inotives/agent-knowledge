@@ -19,11 +19,11 @@ Sessions & Turns → Drafts → Knowledge → Skills & Workflows
      (raw)        (proposed)  (curated)     (actionable)
 ```
 
-- **Tier 1: Drafts** — Auto-generated session summaries and daily review outputs
+- **Tier 1: Drafts** — Auto-generated session summaries (`drafts/sessions/`)
 - **Tier 2: Knowledge** — Curated pages organized as a memory palace (entities, concepts, patterns)
 - **Tier 3: Skills & Workflows** — Domain-specific actionable instructions agents can directly use
 
-Users curate knowledge in **Obsidian**. Agents propose, humans approve.
+The MCP is **capture-only**: it produces session drafts and exposes them to the curator. Synthesis of drafts into `knowledge/` and compilation into `skills/` is a **human activity** performed in the memory folder using whatever editor + LLM the curator prefers (typically Claude Code in `~/.agent-knowledge/memory`, or Obsidian + manual edit). Agents propose; humans curate.
 
 ## Architecture
 
@@ -42,19 +42,20 @@ Users curate knowledge in **Obsidian**. Agents propose, humans approve.
 └─────────────────────────────────────────────────────┘
 ```
 
-- **MCP Server** — agents connect via MCP protocol to log sessions, search knowledge, and write pages
-- **CLI (`akw`)** — admin, inspection, and automated daily reviews
+- **MCP Server** — agents connect via MCP protocol to log groups (sessions), search knowledge, and write session drafts
+- **CLI (`akw`)** — admin, inspection, archive, and recovery
 - **Core Library** — shared storage, search, and file operations
 
 ## Key Features
 
 - **Agent-agnostic** — works with any MCP-compatible agent
 - **Cross-agent knowledge sharing** — insights from Claude are available to Codex and vice versa
-- **Automatic session capture** — turns logged incrementally, session drafts generated at session end
-- **Daily review pipeline** — auto-triggered synthesis of session data into knowledge drafts
-- **Three-tier knowledge maturation** — drafts → knowledge → skills & workflows
+- **Automatic session capture** — turns logged incrementally, session drafts generated at segment end
+- **Group/segment lifecycle** — a group is one logical unit of work; continuation reuses the same `group_id` and starts a new segment, so each segment gets its own draft
+- **Indexed pending counts** — `group_start` returns counts of unarchived drafts and incomplete segments so the curator can opt in to review
+- **Three-tier knowledge maturation** — drafts → knowledge → skills & workflows (synthesis is a human activity, not an MCP tool)
 - **Obsidian-native** — all knowledge is plain markdown, browsable as an Obsidian vault
-- **Crash-resilient** — turns saved incrementally, orphaned sessions auto-recovered
+- **Crash-resilient** — turns buffered to disk and persisted incrementally; incomplete segments are recovered on demand via `akw recover`
 
 ## Tech Stack
 
@@ -115,87 +116,115 @@ cd ~/.agent-knowledge/src && git pull && uv tool install --reinstall --from . ag
 | Command | Description |
 |---|---|
 | `akw init` | Initialize data directory and run migrations |
-| `akw status` | Show system stats |
-| `akw sessions` | List recent sessions |
-| `akw session start` | Start a new session (used by hooks) |
-| `akw session end` | End the active session (used by hooks) |
-| `akw session status` | Show active session info |
-| `akw session list` | List sessions for continuation lookup |
-| `akw session prompt` | Buffer user prompt from hook (stdin JSON) |
-| `akw session turn` | Buffer turn from Stop hook (stdin JSON), flushes every N turns |
-| `akw session flush` | Flush buffered turns to database |
-| `akw session context` | Print recent session summary |
+| `akw status` | Show system stats and pending counts (unarchived drafts, incomplete segments) |
+| `akw groups` | List recent groups |
+| `akw group start` | Start (or continue) a group — used by hooks |
+| `akw group end` | End the active segment — used by hooks |
+| `akw group status` | Show active group + segment metadata |
+| `akw group list` | List groups for continuation lookup |
+| `akw group context` | Print recent group/segment summary |
+| `akw group prompt` | Buffer user prompt from hook (stdin JSON) |
+| `akw group turn` | Buffer turn from Stop hook (stdin JSON); flushes every N turns |
+| `akw group flush` | Flush buffered turns to database |
+| `akw group turns <id> [--segment-start ISO]` | Print raw turns for a group's segment (used by recovery follow-ups) |
 | `akw search "query"` | Search knowledge from terminal |
-| `akw review` | Run LLM-powered daily review (requires `ANTHROPIC_API_KEY`) |
-| `akw reindex` | Rebuild search index |
-| `akw purge` | Delete old reviewed sessions |
+| `akw archive <draft_path>` | Archive a session draft into `drafts/archived/sessions/` |
+| `akw recover [--dry-run]` | Write `idle_close` markers and stub drafts for incomplete segments |
+| `akw reindex [--force]` | Rebuild search index and reconcile `draft_state` with on-disk drafts |
+| `akw purge [--older-than N]` | Delete archived drafts older than N days (default 365) |
 
 ## Auto-Session Management
 
-Sessions are fully automated via four Claude Code hooks:
+Groups (sessions) are fully automated via four Claude Code hooks:
 
 | Hook | What it does |
 |---|---|
-| `SessionStart` | Creates a new session, persists `AKW_SESSION_ID` to env |
-| `UserPromptSubmit` | Captures user prompt to temp file |
+| `SessionStart` | Starts (or continues) a group, persists `AKW_GROUP_ID` to env |
+| `UserPromptSubmit` | Captures user prompt to a temp file |
 | `Stop` | Pairs prompt + response, buffers turn (flushes every 10 turns) |
-| `SessionEnd` | Flushes remaining turns, ends session |
+| `SessionEnd` | Flushes remaining turns, ends the active segment |
 
-**For Claude Code:** The install script configures hooks globally in `~/.claude/settings.json`. Hooks skip the wiki folder (`~/.agent-knowledge/memory`) to avoid meta-sessions during review.
+A *group* is one logical unit of work. Continuation reuses the same `group_id` and starts a new *segment* — each segment is one start→end pair on the `turns` table and produces its own draft.
 
-**For other MCP clients:** The MCP server auto-creates a session on first tool use. No hooks or configuration needed.
+**For Claude Code:** The install script configures hooks globally in `~/.claude/settings.json`. Hooks skip the wiki folder (`~/.agent-knowledge/memory`) to avoid meta-sessions during curation.
 
-**Check session status** (inside a Claude session):
+**For other MCP clients:** The MCP server auto-creates a group on first tool use. No hooks or configuration needed.
+
+**Check group status** (inside a Claude session):
 ```
-! akw session status
-```
-
-**Session continuation:** To resume a previous session in a new conversation:
-```
-akw session list --recent    # find the session ID
-# Then tell your agent: "continue session <id>"
+! akw group status
 ```
 
-## Knowledge Review & Promotion
+**Group continuation:** To resume a previous group in a new conversation:
+```
+akw group list --recent    # find the group_id
+# Then tell your agent: "continue group <id>"
+```
 
-Knowledge matures through three tiers: **session drafts → knowledge drafts → curated knowledge**. Agents propose, humans approve.
+## Curation Workflow
+
+Knowledge matures through three tiers: **session drafts → curated knowledge → skills**. The MCP captures; the curator synthesizes.
 
 ### How sessions become knowledge
 
-1. **Session drafts** are auto-generated when a session ends (the agent summarizes before exiting). Missed sessions are caught by the next session's startup review.
-2. **Knowledge drafts** are synthesized from session drafts — either by the agent during catch-up review, or via `akw review`.
-3. **Curated knowledge** is promoted by the user after review.
+1. **Session drafts** are auto-written by the agent at segment end (the agent summarizes its own turns into `drafts/sessions/<group>-<segment_iso>.md`). Incomplete segments are recovered on demand via `akw recover`, which writes a stub draft the curator can fill in or archive.
+2. **Curated knowledge** is **human work**, performed in the memory folder against `drafts/sessions/`. The MCP exposes no `promote_to_knowledge` / `promote_to_skill` tools — promotion is a file-system action, not a tool call.
+3. **Skills & workflows** are likewise compiled by the curator from accumulated knowledge pages.
 
-### Review options
+The contract for frontmatter shapes, source provenance, and house rules lives in `knowledge/knowledge-management.md` inside the deployed memory folder. Point Claude (or any LLM) at that page when synthesizing.
 
-**Option A — Review with Claude in the wiki folder:**
+### Pending counts (opt-in review)
+
+`group_start` returns indexed counts on every new segment:
+
+```json
+{
+  "pending": {
+    "unarchived_session_drafts": 12,
+    "incomplete_segments": 3
+  }
+}
+```
+
+If non-zero, the agent surfaces these in its first reply. The curator decides whether to act — there is no automated synthesis flow.
+
+### Curating with Claude in the wiki folder
+
 ```bash
 cd ~/.agent-knowledge/memory
 claude
 ```
-Then ask Claude to review and promote:
-> "Review the session drafts and promote anything worth keeping to knowledge"
 
-Claude has MCP tools to read drafts, synthesize patterns, write knowledge pages, and promote — you just approve or steer.
+Then ask Claude:
+> "Read knowledge-management.md, then review session drafts. Propose new knowledge pages or updates following the frontmatter conventions."
 
-**Option B — Review in Obsidian:**
+Claude reads/edits files directly; the MCP layer does not gate or summarize this work.
 
-Point Obsidian at `~/.agent-knowledge/memory/`. Browse `drafts/sessions/`, edit what's useful, then ask an agent to promote via `promote_to_knowledge`.
+### Archive flow
 
-**Option C — Automated batch review:**
+Once a session draft is no longer active work, **move** it (don't delete):
+
 ```bash
-ANTHROPIC_API_KEY=... akw review
-```
-Processes all pending session drafts via LLM, generates knowledge drafts, and writes a review report. Can be scheduled as a cron job.
-
-### Promotion flow
-
-```
-drafts/sessions/       →  drafts/knowledge/     →  knowledge/
-(auto, per session)       (review output)           (curated, searchable)
+akw archive drafts/sessions/<group>-<segment>.md
+# or move it manually with `git mv` and run `akw reindex`
 ```
 
-Only curated knowledge in `knowledge/` and `skills/` is indexed for search. Drafts are proposals — they don't pollute search results.
+Archived drafts live under `drafts/archived/sessions/`, are excluded from search, and are deleted by `akw purge` at the retention boundary (365-day default).
+
+### Recovery
+
+If an agent crashes before writing an end marker, or writes the marker but no draft, the segment is *incomplete*. Run:
+
+```bash
+akw recover --dry-run   # preview
+akw recover             # write idle_close markers + stub drafts
+```
+
+Stub drafts carry `recovery_kind: idle_close` (or `closed_no_draft`) in frontmatter. The curator fills them in from raw turns (`akw group turns <id> --segment-start <iso>`) or archives them as-is.
+
+### Search
+
+Only curated `knowledge/` and `skills/` are indexed for search. Drafts (active and archived) are excluded — they are source material, not authoritative content.
 
 ## Documentation
 

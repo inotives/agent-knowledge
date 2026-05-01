@@ -1,14 +1,25 @@
-"""CLI entry point — admin and inspection commands for agent-knowledge."""
+"""CLI entry point — admin and inspection commands for agent-knowledge.
+
+EP-00005: groups replace sessions; capture-only scope. The legacy `akw review`
+LLM-synthesis flow has been removed — synthesis is human work performed in the
+memory folder with whatever tools the curator chooses.
+"""
 
 from __future__ import annotations
 
+import json as json_mod
+import os
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import click
 
 from agent_knowledge.core.config import load_config
-from agent_knowledge.core import storage, memory, search
+from agent_knowledge.core import storage, memory, search, paths
 
+
+# --- Top-level group ---
 
 @click.group()
 def main():
@@ -16,21 +27,20 @@ def main():
     pass
 
 
+# --- init / status / search / reindex ---
+
 @main.command()
 def init():
     """Initialize data directory, folder structure, and run migrations."""
     config = load_config()
 
-    # Create data directory
     config.data_dir.mkdir(parents=True, exist_ok=True)
     config.db_dir.mkdir(parents=True, exist_ok=True)
     click.echo(f"Data directory: {config.data_dir}")
 
-    # Create memory folder structure
     memory.ensure_memory_dirs(config.memory_dir)
     click.echo(f"Memory directory: {config.memory_dir}")
 
-    # Connect triggers auto-migration
     conn = storage.connect(config.sessions_db)
     click.echo(f"Database: {config.sessions_db}")
     conn.close()
@@ -40,47 +50,124 @@ def init():
 
 @main.command()
 def status():
-    """Show system stats."""
+    """Show system stats and pending review counts."""
     config = load_config()
-
     if not config.sessions_db.exists():
         click.echo("Not initialized. Run 'akw init' first.")
         return
 
     conn = storage.connect(config.sessions_db)
 
-    # Counts
     projects = storage.list_projects(conn)
-    sessions = storage.list_sessions(conn)
-    reviewed = [s for s in sessions if s["reviewed_at"] is not None]
-    pending = [s for s in sessions if s["ended_at"] is not None and s["reviewed_at"] is None]
+    all_groups = storage.list_groups(conn)
+    open_groups = storage.get_open_groups(conn)
+    orphans = storage.get_orphaned_groups(conn)
+    closed_no_draft = storage.get_closed_no_draft_segments(conn)
+    incomplete_total = len(orphans) + len(closed_no_draft)
+    unarchived_today = storage.count_unarchived_session_drafts(conn, exclude_today=False)
+    unarchived_pending = storage.count_unarchived_session_drafts(conn, exclude_today=True)
 
     click.echo(f"Data directory:  {config.data_dir}")
     click.echo(f"Projects:        {len(projects)}")
-    click.echo(f"Sessions:        {len(sessions)} ({len(reviewed)} reviewed, {len(pending)} pending review)")
+    click.echo(f"Groups:          {len(all_groups)} ({len(open_groups)} open, {len(orphans)} orphaned)")
+    click.echo(f"Session drafts:  {unarchived_today} unarchived ({unarchived_pending} from prior days)")
+    click.echo(f"Incomplete:      {incomplete_total} segment(s) ({len(orphans)} orphan, {len(closed_no_draft)} closed-no-draft)")
 
-    # Memory page counts
-    for tier, subdir in [("Drafts", "drafts"), ("Knowledge", "knowledge"), ("Skills", "skills")]:
+    for label, subdir in [
+        ("Knowledge", "2_knowledges"),
+        ("Skills", "3_intelligences/skills"),
+        ("Agents", "3_intelligences/agents"),
+    ]:
         pages = memory.list_pages(config.memory_dir, subdir)
-        click.echo(f"{tier} pages:    {len(pages)}")
+        click.echo(f"{label} pages:    {len(pages)}")
 
-    # Search index
-    if config.search_db.exists():
+    if config.memory_dir.exists():
         duckdb_conn = search.connect(config.search_db)
-        index = search.get_index(duckdb_conn)
-        click.echo(f"Search index:    {len(index)} pages indexed")
+        count = search.sync_from_files(duckdb_conn, config.memory_dir)
+        click.echo(f"Search index:    {count} pages indexed")
         duckdb_conn.close()
     else:
         click.echo("Search index:    not built")
 
+    if incomplete_total:
+        click.echo("")
+        click.echo(f"Run 'akw recover' to write stub drafts for the {incomplete_total} incomplete segment(s).")
+
     conn.close()
 
 
+@main.command("search")
+@click.argument("query")
+@click.option("--tier", "-t", default=None, help="Filter by tier: knowledge, skill, agent, session_draft, session_archived.")
+def search_cmd(query: str, tier: str | None):
+    """Search memory from the terminal."""
+    config = load_config()
+    if not config.memory_dir.exists():
+        click.echo("Memory folder not initialized. Run 'akw init' first.")
+        return
+
+    duckdb_conn = search.connect(config.search_db)
+    search.sync_from_files(duckdb_conn, config.memory_dir)
+
+    results = search.search(duckdb_conn, query, tier)
+    if not results:
+        click.echo("No results found.")
+        duckdb_conn.close()
+        return
+
+    for r in results:
+        click.echo(f"  [{r['tier']}] {r['path']}")
+        if r.get("summary"):
+            click.echo(f"    {r['summary'][:100]}")
+
+    click.echo(f"\n{len(results)} results.")
+    duckdb_conn.close()
+
+
+@main.command()
+@click.option("--force", is_flag=True, help="Drift-recover draft_state from frontmatter even if the table is non-empty.")
+def reindex(force: bool):
+    """Rebuild DuckDB search index + reconcile draft_state with on-disk drafts.
+
+    Two roles per Decision C of EP-00005:
+    - Drift recovery: rebuild draft_state from frontmatter when the table is
+      missing or known-stale. Requires `--force` if the table is non-empty.
+    - Reconciliation: pick up file moves the curator made by hand (e.g.
+      `git mv` into `1_drafts/_archived/`). Always safe.
+    """
+    config = load_config()
+    if not config.memory_dir.exists():
+        click.echo("Not initialized. Run 'akw init' first.")
+        return
+
+    duckdb_conn = search.connect(config.search_db)
+    count = search.sync_from_files(duckdb_conn, config.memory_dir)
+    click.echo(f"Search index: {count} pages.")
+    duckdb_conn.close()
+
+    conn = storage.connect(config.sessions_db)
+    try:
+        result = storage.reindex_draft_state(conn, config.memory_dir, force=force)
+    finally:
+        conn.close()
+
+    if result["had_existing_rows"] and not force and result["rebuilt"] == 0:
+        click.echo(
+            f"draft_state: {result['reconciled']} reconciled (file moves). "
+            f"Run with --force to rebuild from frontmatter."
+        )
+    else:
+        click.echo(
+            f"draft_state: {result['rebuilt']} rebuilt, {result['reconciled']} reconciled."
+        )
+
+
+# --- groups subcommand (replaces sessions listing) ---
+
 @main.command()
 @click.option("--project", "-p", default=None, help="Filter by project name or ID.")
-@click.option("--date", "-d", default=None, help="Filter by date (YYYY-MM-DD).")
-def sessions(project: str | None, date: str | None):
-    """List recent sessions with summaries."""
+def groups(project: str | None):
+    """List groups with start metadata + latest activity."""
     config = load_config()
     if not config.sessions_db.exists():
         click.echo("Not initialized. Run 'akw init' first.")
@@ -88,11 +175,9 @@ def sessions(project: str | None, date: str | None):
 
     conn = storage.connect(config.sessions_db)
 
-    # Resolve project name to ID if needed
     project_id = None
     if project:
-        projects = storage.list_projects(conn)
-        for p in projects:
+        for p in storage.list_projects(conn):
             if p["id"] == project or p["name"] == project:
                 project_id = p["id"]
                 break
@@ -101,146 +186,175 @@ def sessions(project: str | None, date: str | None):
             conn.close()
             return
 
-    results = storage.list_sessions(conn, project_id=project_id, date=date)
+    filter_md = {"project_id": project_id} if project_id else None
+    results = storage.list_groups(conn, filter_metadata=filter_md)
     if not results:
-        click.echo("No sessions found.")
+        click.echo("No groups found.")
         conn.close()
         return
 
-    for s in results:
-        turns = storage.get_turns(conn, s["id"])
-        status = "reviewed" if s["reviewed_at"] else ("ended" if s["ended_at"] else "active")
-        click.echo(f"\n[{status}] {s['started_at'][:16]} | {s['agent']} | {s['type']}")
-        click.echo(f"  ID: {s['id'][:12]}... | Turns: {len(turns)}")
-        if turns:
-            click.echo(f"  Last: {turns[-1]['request'][:80]}")
+    for g in results:
+        gid_short = g["group_id"][:12] if g["group_id"] else "(none)"
+        agent = (g.get("metadata") or {}).get("agent", "?")
+        started = (g.get("started_at") or "")[:16]
+        latest = (g.get("latest_at") or "")[:16]
+        latest_kind = g.get("latest_kind") or "?"
+        click.echo(f"[{latest_kind:<10}] {gid_short}... | started {started} | last {latest} | {agent}")
 
     conn.close()
 
 
+# --- group lifecycle subgroup (used by hooks and scripts) ---
+
 @main.group()
-def session():
-    """Session lifecycle commands (used by hooks and scripts)."""
+def group():
+    """Group lifecycle commands (used by hooks and scripts)."""
     pass
 
 
-main.add_command(session)
+main.add_command(group)
 
 
-@session.command("start")
+@group.command("start")
+@click.option("--group-id", "-g", default=None, help="Group ID to continue (omit for new group).")
 @click.option("--project", "-p", default=None, help="Project name or ID.")
 @click.option("--agent", "-a", default="claude", help="Agent name.")
-@click.option("--type", "-t", "session_type", default="coding", help="Session type.")
-@click.option("--continue", "continue_id", default=None, help="Session ID to continue.")
-def session_start(project: str | None, agent: str, session_type: str, continue_id: str | None):
-    """Start a new session. Closes any existing open sessions first. Prints session ID to stdout."""
+@click.option("--working-dir", default=None, help="Working directory path metadata.")
+def group_start(
+    group_id: str | None,
+    project: str | None,
+    agent: str,
+    working_dir: str | None,
+):
+    """Start a new group (or continue one). Prints group_id to stdout for hook capture."""
     config = load_config()
     conn = storage.connect(config.sessions_db)
 
-    # Resolve project name to ID, auto-create if not found
-    project_id = None
+    project_id: str | None = None
     if project:
-        projects = storage.list_projects(conn)
-        for p in projects:
+        for p in storage.list_projects(conn):
             if p["id"] == project or p["name"] == project:
                 project_id = p["id"]
                 break
         if project_id is None:
-            # Auto-register project with the name and current dir as path
-            import os
-            path = os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd())
+            path = working_dir or os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd())
             new_project = storage.create_project(conn, project, path)
             project_id = new_project["id"]
 
-    # Close any existing open sessions (orphan cleanup)
-    storage.close_orphaned_sessions(conn, older_than_hours=0)
+    md: dict = {"agent": agent}
+    if project_id:
+        md["project_id"] = project_id
+    if working_dir:
+        md["working_dir"] = working_dir
 
-    # Continuation
-    if continue_id:
-        session = storage.reopen_session(conn, continue_id)
-        if session is None:
-            click.echo(f"Session not found: {continue_id}", err=True)
-            conn.close()
-            raise SystemExit(1)
-        if project_id or agent:
-            storage.update_session_metadata(
-                conn, session["id"],
-                project_id=project_id, agent=agent, session_type=session_type,
-            )
-        click.echo(session["id"])
-        conn.close()
-        return
-
-    # Create new session
-    session = storage.create_session(conn, project_id, agent, session_type)
-    click.echo(session["id"])
+    result = storage.start_group(
+        conn, group_id=group_id, agent=agent, metadata=md,
+    )
+    click.echo(result["group_id"])
     conn.close()
 
 
-@session.command("end")
-@click.option("--session", "-s", "session_id", default=None, help="Session ID to end (default: most recent open).")
-def session_end(session_id: str | None):
-    """End a session. If no ID given, ends the most recent open session. Idempotent."""
+@group.command("end")
+@click.option("--group-id", "-g", "group_id", default=None, help="Group ID to end (default: most recent open).")
+def group_end(group_id: str | None):
+    """End the current segment of a group. Idempotent."""
     config = load_config()
     conn = storage.connect(config.sessions_db)
 
-    if session_id is None:
-        session = storage.get_most_recent_open_session(conn)
-        if session is None:
-            click.echo("No open session to end.", err=True)
+    gid = group_id
+    if gid is None:
+        open_groups = storage.get_open_groups(conn)
+        if not open_groups:
+            click.echo("No open group to end.", err=True)
             conn.close()
             return
-        session_id = session["id"]
+        gid = max(open_groups, key=lambda g: g["latest_at"])["group_id"]
 
-    result = storage.end_session(conn, session_id)
-    if result:
-        click.echo(f"{session_id}")
+    result = storage.end_group(conn, gid, kind="end")
+    if result is None:
+        click.echo(f"Group has no turns: {gid}", err=True)
+    else:
+        click.echo(gid)
     conn.close()
 
 
-@session.command("status")
-def session_status():
-    """Show the currently active session."""
+@group.command("status")
+def group_status():
+    """Show the most recent open group + its segment."""
     config = load_config()
     if not config.sessions_db.exists():
         click.echo("Not initialized. Run 'akw init' first.")
         return
 
     conn = storage.connect(config.sessions_db)
-    session = storage.get_most_recent_open_session(conn)
-    if session is None:
-        click.echo("No active session.")
-    else:
-        turns = storage.get_turns(conn, session["id"])
-        click.echo(f"Session: {session['id']}")
-        click.echo(f"Agent:   {session['agent']}")
-        click.echo(f"Type:    {session['type']}")
-        click.echo(f"Started: {session['started_at'][:16]}")
-        click.echo(f"Project: {session['project_id'] or '(none)'}")
-        click.echo(f"Turns:   {len(turns)}")
+    open_groups = storage.get_open_groups(conn)
+    if not open_groups:
+        click.echo("No active group.")
+        conn.close()
+        return
+
+    chosen = max(open_groups, key=lambda g: g["latest_at"])
+    gid = chosen["group_id"]
+    md = chosen.get("start_marker_metadata") or {}
+    seg_turns = storage.get_current_segment_turns(conn, gid)
+    turn_count = sum(1 for t in seg_turns if t["kind"] == "turn")
+    seg_start = next((t["created_at"] for t in seg_turns if t["kind"] == "start"), None)
+
+    click.echo(f"Group:           {gid}")
+    click.echo(f"Agent:           {md.get('agent', '?')}")
+    click.echo(f"Project:         {md.get('project_id') or '(none)'}")
+    click.echo(f"Segment start:   {seg_start[:19] if seg_start else '(none)'}")
+    click.echo(f"Latest activity: {chosen['latest_at'][:19]}")
+    click.echo(f"Turns:           {turn_count}")
     conn.close()
 
 
-@session.command("context")
-def session_context():
-    """Print recent session context summary (used by hooks)."""
+@group.command("list")
+@click.option("--recent", "-r", is_flag=True, help="Show only recent groups (last 10).")
+def group_list(recent: bool):
+    """List groups for continuation lookup."""
+    config = load_config()
+    if not config.sessions_db.exists():
+        click.echo("Not initialized. Run 'akw init' first.")
+        return
+
+    conn = storage.connect(config.sessions_db)
+    results = storage.list_groups(conn)
+    if recent:
+        results = results[-10:]
+
+    if not results:
+        click.echo("No groups found.")
+        conn.close()
+        return
+
+    for g in results:
+        gid_short = g["group_id"][:12]
+        md = g.get("metadata") or {}
+        agent = md.get("agent", "?")
+        started = (g.get("started_at") or "")[:16]
+        latest_kind = g.get("latest_kind") or "?"
+        click.echo(f"[{latest_kind:<10}] {gid_short}... | {started} | {agent}")
+    conn.close()
+
+
+@group.command("context")
+def group_context():
+    """Print recent group summaries to stderr (used by SessionStart hook)."""
     config = load_config()
     if not config.sessions_db.exists():
         return
 
     conn = storage.connect(config.sessions_db)
-    current = storage.get_most_recent_open_session(conn)
-    exclude_id = current["id"] if current else ""
-    _print_session_context(conn, exclude_id)
+    open_groups = storage.get_open_groups(conn)
+    current_id = max(open_groups, key=lambda g: g["latest_at"])["group_id"] if open_groups else ""
+    _print_group_context(conn, current_id, config.memory_dir)
     conn.close()
 
 
-@session.command("prompt")
-def session_prompt():
+@group.command("prompt")
+def group_prompt():
     """Save user prompt from UserPromptSubmit hook. Paired with next Stop response."""
-    import json as json_mod
-    import sys
-
     config = load_config()
     try:
         hook_data = json_mod.load(sys.stdin)
@@ -259,20 +373,18 @@ def session_prompt():
     prompt_file.write_text(prompt)
 
 
-@session.command("turn")
+@group.command("turn")
 @click.option("--batch-size", "-b", default=10, help="Flush after this many buffered turns.")
-def session_turn(batch_size: int):
+def group_turn(batch_size: int):
     """Buffer a turn from Stop hook. Pairs with pending user prompt. Flushes every N turns."""
-    import json as json_mod
-    import sys
-
     config = load_config()
     conn = storage.connect(config.sessions_db)
 
-    session = storage.get_most_recent_open_session(conn)
-    if session is None:
+    open_groups = storage.get_open_groups(conn)
+    if not open_groups:
         conn.close()
         return
+    gid = max(open_groups, key=lambda g: g["latest_at"])["group_id"]
 
     try:
         hook_data = json_mod.load(sys.stdin)
@@ -288,14 +400,12 @@ def session_turn(batch_size: int):
     if len(assistant_msg) > 200_000:
         assistant_msg = assistant_msg[:200_000] + "..."
 
-    # Read pending user prompt (saved by UserPromptSubmit hook)
     prompt_file = config.data_dir / "pending_prompt.txt"
     user_prompt = ""
     if prompt_file.exists():
         user_prompt = prompt_file.read_text()
         prompt_file.unlink(missing_ok=True)
 
-    # Buffer to temp file
     buffer_file = config.data_dir / "turn_buffer.jsonl"
     turn_entry = json_mod.dumps({
         "request": user_prompt or "(no prompt captured)",
@@ -304,39 +414,65 @@ def session_turn(batch_size: int):
     with open(buffer_file, "a") as f:
         f.write(turn_entry + "\n")
 
-    # Count buffered turns
     with open(buffer_file) as f:
         lines = f.readlines()
 
     if len(lines) >= batch_size:
-        _flush_turn_buffer(conn, session["id"], buffer_file)
+        _flush_turn_buffer(conn, gid, buffer_file)
 
     conn.close()
 
 
-@session.command("flush")
-def session_flush():
+@group.command("flush")
+def group_flush():
     """Flush any buffered turns to the database. Called by SessionEnd hook."""
-    import json as json_mod
-
     config = load_config()
     conn = storage.connect(config.sessions_db)
 
-    session = storage.get_most_recent_open_session(conn)
-    if session is None:
+    open_groups = storage.get_open_groups(conn)
+    if not open_groups:
         conn.close()
         return
+    gid = max(open_groups, key=lambda g: g["latest_at"])["group_id"]
 
     buffer_file = config.data_dir / "turn_buffer.jsonl"
     if buffer_file.exists():
-        _flush_turn_buffer(conn, session["id"], buffer_file)
+        _flush_turn_buffer(conn, gid, buffer_file)
 
     conn.close()
 
 
-def _flush_turn_buffer(conn, session_id: str, buffer_file: Path) -> None:
+@group.command("turns")
+@click.argument("group_id")
+@click.option("--segment-start", default=None, help="Segment start timestamp (ISO). Default: current segment.")
+def group_turns(group_id: str, segment_start: str | None):
+    """Print raw turns for a group's segment (used by `akw recover` follow-ups)."""
+    config = load_config()
+    conn = storage.connect(config.sessions_db)
+
+    if segment_start:
+        rows = storage.get_segment_turns(conn, group_id, segment_start)
+    else:
+        rows = storage.get_current_segment_turns(conn, group_id)
+
+    if not rows:
+        click.echo("No turns found.")
+        conn.close()
+        return
+
+    for t in rows:
+        kind = t["kind"]
+        ts = (t["created_at"] or "")[:19]
+        if kind == "turn":
+            req = (t["request"] or "")[:120]
+            click.echo(f"[turn       ] {ts} | {req}")
+        else:
+            click.echo(f"[{kind:<10}] {ts}")
+    conn.close()
+
+
+def _flush_turn_buffer(conn, group_id: str, buffer_file: Path) -> None:
     """Read buffered turns from file, write to DB, and clear the buffer."""
-    import json as json_mod
     from agent_knowledge.core import sanitizer
 
     if not buffer_file.exists():
@@ -356,86 +492,70 @@ def _flush_turn_buffer(conn, session_id: str, buffer_file: Path) -> None:
                     continue
 
     if turns:
-        storage.create_turns(conn, session_id, turns)
+        storage.create_turns(conn, group_id, turns)
 
-    # Clear buffer
     buffer_file.unlink(missing_ok=True)
 
 
-@session.command("list")
-@click.option("--recent", "-r", is_flag=True, help="Show only recent sessions (last 10).")
-@click.option("--project", "-p", default=None, help="Filter by project name or ID.")
-def session_list(recent: bool, project: str | None):
-    """List sessions for continuation lookup."""
+# --- archive (Phase 4) ---
+
+@main.command()
+@click.argument("draft_path")
+def archive(draft_path: str):
+    """Move a session draft into 1_drafts/_archived/ as a flat-file `sessions__*.md`.
+
+    Records the move in memory_edits so subsequent `akw status` reflects archival.
+    """
     config = load_config()
-    if not config.sessions_db.exists():
-        click.echo("Not initialized. Run 'akw init' first.")
-        return
+    sessions_prefix = paths.SESSIONS_DIR + "/"
+    if not draft_path.startswith(sessions_prefix):
+        click.echo(f"Only {sessions_prefix} paths can be archived. Got: {draft_path}", err=True)
+        raise SystemExit(1)
+
+    full_src = config.memory_dir / draft_path
+    if not full_src.exists():
+        click.echo(f"Draft not found: {draft_path}", err=True)
+        raise SystemExit(1)
+
+    target = paths.archived_session_path(draft_path)
 
     conn = storage.connect(config.sessions_db)
-
-    project_id = None
-    if project:
-        projects = storage.list_projects(conn)
-        for p in projects:
-            if p["id"] == project or p["name"] == project:
-                project_id = p["id"]
-                break
-
-    results = storage.list_sessions(conn, project_id=project_id)
-    if recent:
-        results = results[:10]
-
-    if not results:
-        click.echo("No sessions found.")
+    try:
+        memory.move_page(config.memory_dir, draft_path, target)
+        storage.create_memory_edit(
+            conn, target, "draft", "update",
+            f"Archived from {draft_path}",
+        )
+        # Phase 2: update draft_state row (id stable, draft_path mutates).
+        storage.archive_draft_state(conn, draft_path, target)
+        click.echo(f"Archived: {draft_path} → {target}")
+    except FileExistsError:
+        click.echo(f"Target already exists: {target}", err=True)
+        raise SystemExit(1)
+    finally:
         conn.close()
-        return
-
-    for s in results:
-        turns = storage.get_turns(conn, s["id"])
-        state = "reviewed" if s["reviewed_at"] else ("ended" if s["ended_at"] else "active")
-        click.echo(f"[{state}] {s['started_at'][:16]} | {s['agent']} | {s['type']} | {s['id'][:12]}... | {len(turns)} turns")
-
-    conn.close()
 
 
-@main.command("search")
-@click.argument("query")
-@click.option("--tier", "-t", default=None, help="Filter by tier: knowledge or skill.")
-def search_cmd(query: str, tier: str | None):
-    """Search memory from the terminal."""
-    config = load_config()
-    if not config.search_db.exists():
-        click.echo("Search index not built. Run 'akw init' first.")
-        return
+# --- recover (Phase 4.5) ---
 
-    duckdb_conn = search.connect(config.search_db)
+_STUB_BODY = """# Session segment recovered without summary
 
-    # Sync before searching
-    if config.memory_dir.exists():
-        search.sync_from_files(duckdb_conn, config.memory_dir)
+This segment ended without a clean session-end summary. The agent likely crashed,
+disconnected, or was killed before writing the draft. The raw turns are preserved
+in the database.
 
-    results = search.search(duckdb_conn, query, tier)
-    if not results:
-        click.echo("No results found.")
-        duckdb_conn.close()
-        return
+**Inspect raw turns:** `akw group turns {group_id} --segment-start {segment_start_at}`
 
-    for r in results:
-        click.echo(f"  [{r['tier']}] {r['path']}")
-        if r.get("summary"):
-            click.echo(f"    {r['summary'][:100]}")
-
-    click.echo(f"\n{len(results)} results.")
-    duckdb_conn.close()
+**Next steps (curator's choice):**
+- Read the raw turns and replace this body with a real summary, then archive.
+- If the segment isn't worth preserving, `akw archive {draft_path}` and move on.
+"""
 
 
 @main.command()
-def review():
-    """Run daily review — synthesize pending session drafts into knowledge drafts using LLM."""
-    import os
-    from agent_knowledge.core.config import load_config
-
+@click.option("--dry-run", is_flag=True, help="Print what would happen without writing.")
+def recover(dry_run: bool):
+    """Recover incomplete segments: write idle_close markers for orphans + stub drafts."""
     config = load_config()
     if not config.sessions_db.exists():
         click.echo("Not initialized. Run 'akw init' first.")
@@ -443,287 +563,166 @@ def review():
 
     conn = storage.connect(config.sessions_db)
 
-    # Gather pending items
-    orphans = storage.get_sessions_needing_drafts(conn)
-    unreviewed = storage.get_unreviewed_sessions(conn, exclude_today=False)
+    # Pass 1: orphan groups → write idle_close markers.
+    orphans = storage.get_orphaned_groups(conn)
+    closed_count = 0
+    for orphan in orphans:
+        gid = orphan["group_id"]
+        if dry_run:
+            click.echo(f"[dry-run] would write idle_close for orphan group {gid}")
+        else:
+            storage.end_group(conn, gid, kind="idle_close")
+        closed_count += 1
 
-    if not orphans and not unreviewed:
-        click.echo("No pending sessions to review.")
-        conn.close()
-        return
+    # Pass 2: closed-no-draft segments → stub drafts.
+    # (Re-query so freshly-closed orphans appear.)
+    closed_no_draft = (
+        storage.get_closed_no_draft_segments(conn) if not dry_run else
+        # In dry-run mode the orphans above weren't actually closed, so simulate:
+        storage.get_closed_no_draft_segments(conn) + [
+            {
+                "group_id": o["group_id"],
+                "segment_start_at": (o.get("start_marker_metadata") or {}).get("segment_start_at") or o["latest_at"],
+                "segment_end_at": o["latest_at"],
+                "end_kind": "idle_close",
+                "turn_count": 0,
+                "start_marker_metadata": o.get("start_marker_metadata") or {},
+            } for o in orphans
+        ]
+    )
 
-    # Check API key
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        click.echo("ANTHROPIC_API_KEY not set. Export it or set in .env file.", err=True)
-        conn.close()
-        return
+    stubs_written = 0
+    for seg in closed_no_draft:
+        gid = seg["group_id"]
+        seg_start = seg["segment_start_at"]
+        seg_end = seg["segment_end_at"]
+        end_kind = seg["end_kind"] or "closed_no_draft"
+        recovery_kind = "idle_close" if end_kind == "idle_close" else "closed_no_draft"
+        draft_path = paths.session_draft_path(gid, seg_start)
 
-    try:
-        import anthropic
-    except ImportError:
-        click.echo("anthropic package not installed. Run: uv pip install agent-knowledge[llm]", err=True)
-        conn.close()
-        return
-    client = anthropic.Anthropic(api_key=api_key)
-
-    # Collect all session content for review
-    session_contents = []
-    session_ids = []
-
-    for session in orphans:
-        turns = storage.get_turns(conn, session["id"])
-        if turns:
-            turn_text = "\n".join(f"- Request: {t['request']}\n  Response: {t['response']}" for t in turns)
-            session_contents.append(f"## Session: {session['agent']} ({session['type']}) — {session['started_at'][:10]}\n{turn_text}")
-            session_ids.append(session["id"])
-
-    for session in unreviewed:
-        draft_path = storage.get_session_draft_path(conn, session["id"])
-        if draft_path:
-            try:
-                content = memory.read_page(config.memory_dir, draft_path)
-                session_contents.append(f"## Session Draft: {session['agent']} ({session['type']}) — {session['started_at'][:10]}\n{content}")
-                session_ids.append(session["id"])
-            except FileNotFoundError:
-                turns = storage.get_turns(conn, session["id"])
-                if turns:
-                    turn_text = "\n".join(f"- Request: {t['request']}\n  Response: {t['response']}" for t in turns)
-                    session_contents.append(f"## Session: {session['agent']} ({session['type']}) — {session['started_at'][:10]}\n{turn_text}")
-                    session_ids.append(session["id"])
-
-    if not session_contents:
-        click.echo("No session content to review.")
-        conn.close()
-        return
-
-    click.echo(f"Reviewing {len(session_contents)} sessions...")
-
-    # Call LLM
-    all_content = "\n\n".join(session_contents)
-    prompt = f"""You are reviewing AI agent session logs to extract reusable knowledge.
-
-Analyze the following session data and:
-1. Identify key decisions, patterns, and learnings
-2. Detect cross-session patterns if multiple sessions exist
-3. Write knowledge draft pages in markdown format
-
-For each knowledge draft, output it in this format:
----DRAFT---
-title: <title>
-tags: <comma-separated tags>
-summary: <one-line summary>
----
-<markdown content>
----END---
-
-Focus on actionable, reusable knowledge. Skip trivial or one-off details.
-
-Session data:
-{all_content}"""
-
-    try:
-        response = client.messages.create(
-            model=config.llm.model,
-            max_tokens=4096,
-            messages=[{"role": "user", "content": prompt}],
+        body = _STUB_BODY.format(
+            group_id=gid,
+            segment_start_at=seg_start,
+            draft_path=draft_path,
         )
-        llm_output = response.content[0].text
-    except Exception as e:
-        click.echo(f"LLM error: {e}", err=True)
-        conn.close()
-        return
+        frontmatter = (
+            "---\n"
+            f"group_id: {gid}\n"
+            f"segment_start_at: {seg_start}\n"
+            f"segment_end_at: {seg_end}\n"
+            f"source_metadata: {json_mod.dumps(seg.get('start_marker_metadata') or {})}\n"
+            f"created_at: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+            f"recovery_kind: {recovery_kind}\n"
+            f"turn_count: {seg.get('turn_count', 0)}\n"
+            "---\n\n"
+        )
+        page_content = frontmatter + body
 
-    # Parse drafts from LLM output
-    from datetime import datetime, timezone
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    drafts_written = 0
-
-    parts = llm_output.split("---DRAFT---")
-    for part in parts[1:]:  # Skip text before first draft
-        if "---END---" not in part:
+        if dry_run:
+            click.echo(f"[dry-run] would write stub: {draft_path}")
+            stubs_written += 1
             continue
-        draft_content = part.split("---END---")[0].strip()
-
-        # Parse header
-        lines = draft_content.split("\n")
-        title = "Untitled"
-        tags_str = ""
-        summary_line = ""
-        content_start = 0
-
-        for i, line in enumerate(lines):
-            if line.startswith("title:"):
-                title = line.split(":", 1)[1].strip()
-            elif line.startswith("tags:"):
-                tags_str = line.split(":", 1)[1].strip()
-            elif line.startswith("summary:"):
-                summary_line = line.split(":", 1)[1].strip()
-            elif line == "---":
-                content_start = i + 1
-                break
-
-        md_content = "\n".join(lines[content_start:]).strip()
-        if not md_content:
-            continue
-
-        # Write draft
-        slug = title.lower().replace(" ", "-")[:50]
-        draft_path = f"drafts/knowledge/{today}-{slug}.md"
-        tags = [t.strip() for t in tags_str.split(",") if t.strip()]
 
         try:
-            from agent_knowledge.core import sanitizer
-            md_content, _ = sanitizer.redact(md_content)
-
-            page_content = ""
-            if tags or summary_line:
-                page_content += "---\n"
-                if tags:
-                    page_content += f"tags: {tags}\n"
-                if summary_line:
-                    page_content += f"summary: {summary_line}\n"
-                page_content += "---\n\n"
-            page_content += f"# {title}\n\n{md_content}"
-
             memory.create_page(config.memory_dir, draft_path, page_content)
-            storage.create_memory_edit(conn, draft_path, "draft", "create", summary_line or f"Review draft: {title}")
-            click.echo(f"  Draft: {draft_path}")
-            drafts_written += 1
+            storage.create_memory_edit(
+                conn, draft_path, "draft", "create",
+                f"Recovery stub ({recovery_kind})",
+                group_id=gid,
+            )
+            # Phase 2: write a draft_state row so pending counts pick this up.
+            storage.upsert_draft_state(
+                conn,
+                draft_path=draft_path,
+                group_id=gid,
+                segment_start_at=seg_start,
+                segment_end_at=seg_end,
+            )
+            click.echo(f"Wrote stub: {draft_path}")
+            stubs_written += 1
         except FileExistsError:
-            click.echo(f"  Skipped (exists): {draft_path}")
+            # Already exists — skip silently (idempotency).
+            pass
 
-    # Write review report
-    report_path = f"drafts/reviews/{today}.md"
-    report = f"# Daily Review — {today}\n\nSessions reviewed: {len(session_ids)}\nDrafts generated: {drafts_written}\n\n{llm_output}"
-    try:
-        memory.create_page(config.memory_dir, report_path, report)
-        click.echo(f"  Report: {report_path}")
-    except FileExistsError:
-        click.echo(f"  Report exists: {report_path}")
-
-    # Mark sessions as reviewed and clean up session drafts
-    for sid in session_ids:
-        storage.set_session_reviewed(conn, sid)
-        draft_path = storage.get_session_draft_path(conn, sid)
-        if draft_path:
-            try:
-                memory.delete_page(config.memory_dir, draft_path)
-            except FileNotFoundError:
-                pass
-
-    click.echo(f"\nReview complete: {len(session_ids)} sessions reviewed, {drafts_written} drafts written.")
+    if dry_run:
+        click.echo(f"\n[dry-run] would close {closed_count} orphan(s); would write {stubs_written} stub draft(s).")
+    else:
+        click.echo(f"\nClosed {closed_count} orphan(s); wrote {stubs_written} stub draft(s).")
     conn.close()
 
 
+# --- maintenance: purge ---
+
 @main.command()
-@click.option("--older-than", default=365, help="Purge sessions older than N days (default: 365).")
+@click.option("--older-than", default=365, help="Purge archived drafts older than N days (default: 365).")
 def purge(older_than: int):
-    """Delete reviewed sessions and turns older than retention period."""
+    """Delete archived session drafts older than the retention boundary."""
     config = load_config()
-    if not config.sessions_db.exists():
-        click.echo("Not initialized. Run 'akw init' first.")
+    archive_dir = config.memory_dir / "drafts" / "archived" / "sessions"
+    if not archive_dir.exists():
+        click.echo(f"Archive directory does not exist: {archive_dir}")
         return
 
-    conn = storage.connect(config.sessions_db)
+    cutoff = (datetime.now(timezone.utc) - __import__("datetime").timedelta(days=older_than)).timestamp()
+    purged = 0
+    for path in archive_dir.glob("**/*.md"):
+        if path.stat().st_mtime < cutoff:
+            path.unlink()
+            purged += 1
 
-    from datetime import datetime, timezone, timedelta
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than)).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    all_sessions = storage.list_sessions(conn)
-    to_purge = [
-        s for s in all_sessions
-        if s["reviewed_at"] is not None and s["started_at"] < cutoff
-    ]
-
-    if not to_purge:
-        click.echo(f"No reviewed sessions older than {older_than} days to purge.")
-        conn.close()
-        return
-
-    purged_turns = 0
-    for session in to_purge:
-        turns = storage.get_turns(conn, session["id"])
-        purged_turns += len(turns)
-
-        draft_path = storage.get_session_draft_path(conn, session["id"])
-        if draft_path:
-            try:
-                memory.delete_page(config.memory_dir, draft_path)
-            except FileNotFoundError:
-                pass
-
-        conn.execute("DELETE FROM turns WHERE session_id = ?", (session["id"],))
-        conn.execute("DELETE FROM memory_edits WHERE session_id = ?", (session["id"],))
-        conn.execute("DELETE FROM sessions WHERE id = ?", (session["id"],))
-
-    conn.commit()
-    click.echo(f"Purged {len(to_purge)} sessions, {purged_turns} turns (older than {older_than} days).")
-    conn.close()
+    click.echo(f"Purged {purged} archived draft(s) older than {older_than} days.")
 
 
-@main.command()
-def reindex():
-    """Rebuild DuckDB search index from /memory/knowledge and /memory/skills."""
-    config = load_config()
-    if not config.memory_dir.exists():
-        click.echo("Not initialized. Run 'akw init' first.")
-        return
+# --- Helpers ---
 
-    duckdb_conn = search.connect(config.search_db)
-    count = search.sync_from_files(duckdb_conn, config.memory_dir)
-    click.echo(f"Indexed {count} pages.")
-    duckdb_conn.close()
-
-
-def _print_session_context(conn, exclude_session_id: str) -> None:
-    """Print recent session summaries to stderr (Claude Code displays hook stderr)."""
-    import sys
-
-    recent = storage.list_sessions(conn)[:6]  # last 6 sessions
-    recent = [s for s in recent if s["id"] != exclude_session_id]
+def _print_group_context(conn, exclude_group_id: str, memory_dir: Path) -> None:
+    """Print recent group summaries to stderr (Claude Code displays hook stderr)."""
+    recent = storage.list_groups(conn)[-6:]  # last 6 groups
+    recent = [g for g in recent if g["group_id"] != exclude_group_id]
     if not recent:
         return
 
-    lines = ["[agent-knowledge] recent sessions:"]
-    for s in recent[:5]:
-        turns = storage.get_turns(conn, s["id"])
-        state = "reviewed" if s["reviewed_at"] else ("ended" if s["ended_at"] else "active")
-        date = s["started_at"][:16]
-        turn_count = len(turns)
+    lines = ["[agent-knowledge] recent groups:"]
+    for g in recent[-5:]:
+        gid_short = g["group_id"][:12]
+        md = g.get("metadata") or {}
+        agent = md.get("agent", "?")
+        date = (g.get("started_at") or "")[:16]
+        latest_kind = g.get("latest_kind") or "?"
+        turns = storage.get_group_turns(conn, g["group_id"])
+        turn_count = sum(1 for t in turns if t["kind"] == "turn")
 
-        # Build a brief summary from last turn
         summary = ""
-        if turns:
-            last_req = turns[-1]["request"][:80]
-            summary = f" — {last_req}"
+        last_turn = next(
+            (t for t in reversed(turns) if t["kind"] == "turn" and t["request"]),
+            None,
+        )
+        if last_turn:
+            summary = f" — {last_turn['request'][:80]}"
 
-        lines.append(f"  [{state}] {date} | {s['agent']} | {s['type']} | {turn_count} turns{summary}")
+        lines.append(f"  [{latest_kind:<10}] {date} | {agent} | {turn_count} turns | {gid_short}...{summary}")
 
         # Show session draft if it exists
-        draft_path = storage.get_session_draft_path(conn, s["id"])
+        draft_path = storage.get_segment_draft_path(conn, g["group_id"])
         if draft_path:
             try:
-                content = memory.read_page(
-                    __import__("agent_knowledge.core.config", fromlist=["load_config"]).load_config().memory_dir,
-                    draft_path,
-                )
-                # Show first 2 non-empty, non-frontmatter lines as highlight
+                content = memory.read_page(memory_dir, draft_path)
                 content_lines = [
-                    l.strip() for l in content.split("\n")
-                    if l.strip() and not l.startswith("---") and not l.startswith("tags:") and not l.startswith("summary:")
+                    line.strip() for line in content.split("\n")
+                    if line.strip() and not line.startswith("---")
+                    and not line.startswith("tags:") and not line.startswith("summary:")
+                    and not line.startswith("group_id:") and not line.startswith("segment_")
                 ]
                 for cl in content_lines[:2]:
                     lines.append(f"    {cl[:100]}")
             except FileNotFoundError:
                 pass
 
-    # Stats
-    all_sessions = storage.list_sessions(conn)
-    pending = sum(1 for s in all_sessions if s["ended_at"] and not s["reviewed_at"])
-    if pending:
-        lines.append(f"  ({pending} session(s) pending review)")
+    # Pending counts
+    orphans = storage.get_orphaned_groups(conn)
+    closed_no_draft = storage.get_closed_no_draft_segments(conn)
+    incomplete = len(orphans) + len(closed_no_draft)
+    if incomplete:
+        lines.append(f"  ({incomplete} incomplete segment(s) — run `akw recover`)")
 
-    click.echo("\n".join(lines))
-
-
+    click.echo("\n".join(lines), err=True)

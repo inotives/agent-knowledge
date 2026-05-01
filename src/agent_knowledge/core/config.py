@@ -1,7 +1,12 @@
-"""Configuration loader — reads [tool.agent-knowledge] from pyproject.toml."""
+"""Configuration loader — reads [tool.agent-knowledge] from pyproject.toml.
+
+Environment overrides (highest precedence):
+- AKW_DATA_DIR — override data_dir path
+"""
 
 from __future__ import annotations
 
+import os
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,19 +42,24 @@ class Config:
 
 
 def load_config(pyproject_path: Path | None = None) -> Config:
-    """Load config from pyproject.toml [tool.agent-knowledge] section."""
+    """Load config from pyproject.toml [tool.agent-knowledge] section.
+
+    Precedence: AKW_DATA_DIR env var > pyproject.toml > defaults.
+    """
+    env_data_dir = os.environ.get("AKW_DATA_DIR")
+
     if pyproject_path is None:
         pyproject_path = _find_pyproject()
 
     if pyproject_path is None or not pyproject_path.exists():
+        if env_data_dir:
+            return Config(data_dir=Path(env_data_dir).expanduser())
         return Config()
 
     with open(pyproject_path, "rb") as f:
         data = tomllib.load(f)
 
     section = data.get("tool", {}).get("agent-knowledge", {})
-    if not section:
-        return Config()
 
     llm_data = section.get("llm", {})
     llm_defaults = LLMConfig()
@@ -59,9 +69,9 @@ def load_config(pyproject_path: Path | None = None) -> Config:
     )
 
     defaults = Config()
-    data_dir = section.get("data_dir", str(defaults.data_dir))
+    data_dir_str = env_data_dir or section.get("data_dir", str(defaults.data_dir))
     return Config(
-        data_dir=Path(data_dir).expanduser(),
+        data_dir=Path(data_dir_str).expanduser(),
         search_engine=section.get("search_engine", defaults.search_engine),
         llm=llm,
     )
