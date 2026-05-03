@@ -12,10 +12,29 @@ CLAUDE_MCP="$HOME/.claude/.mcp.json"
 
 echo "==> Installing agent-knowledge..."
 
-# Check prerequisites
+# Bootstrap apt deps on Debian/Ubuntu/Mint if missing
+if [ -f /etc/debian_version ] && command -v apt-get &>/dev/null; then
+    missing=()
+    command -v git &>/dev/null  || missing+=(git)
+    command -v curl &>/dev/null || missing+=(curl)
+    if [ "${#missing[@]}" -gt 0 ]; then
+        echo "==> Installing system packages: ${missing[*]} (sudo required)"
+        sudo apt-get update -qq
+        sudo apt-get install -y "${missing[@]}"
+    fi
+fi
+
+# Bootstrap uv if missing
 if ! command -v uv &>/dev/null; then
-    echo "Error: uv not found. Install it: https://docs.astral.sh/uv/getting-started/installation/"
-    exit 1
+    echo "==> Installing uv..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    # uv installs to ~/.local/bin; ensure it's on PATH for this script
+    export PATH="$HOME/.local/bin:$PATH"
+    if ! command -v uv &>/dev/null; then
+        echo "Error: uv installation completed but binary not found on PATH."
+        echo "       Add ~/.local/bin to your shell PATH and re-run this script."
+        exit 1
+    fi
 fi
 
 # Clone or update source
@@ -43,25 +62,25 @@ cp "$INSTALL_DIR/.claude/hooks/"*.sh "$HOOKS_DIR/"
 chmod +x "$HOOKS_DIR/"*.sh
 echo "  Installed $(ls "$HOOKS_DIR/"*.sh | wc -l | tr -d ' ') hooks to $HOOKS_DIR"
 
-# Configure MCP server for Claude Code
-echo "==> Configuring Claude Code MCP server..."
-mkdir -p "$HOME/.claude"
-if [ -f "$CLAUDE_MCP" ]; then
-    python3 -c "
+# Configure Claude Code only if it's already installed (~/.claude exists).
+# For other MCP clients (opencode, etc.), the user wires up MCP themselves.
+if [ -d "$HOME/.claude" ]; then
+    echo "==> Configuring Claude Code MCP server..."
+    if [ -f "$CLAUDE_MCP" ]; then
+        python3 -c "
 import json
 with open('$CLAUDE_MCP') as f: data = json.load(f)
 data.setdefault('mcpServers', {})['agent-knowledge'] = {'command': 'agent-knowledge-server'}
 with open('$CLAUDE_MCP', 'w') as f: json.dump(data, f, indent=2)
 print('  Updated $CLAUDE_MCP')
 "
-else
-    echo '{"mcpServers":{"agent-knowledge":{"command":"agent-knowledge-server"}}}' | python3 -m json.tool > "$CLAUDE_MCP"
-    echo "  Created $CLAUDE_MCP"
-fi
+    else
+        echo '{"mcpServers":{"agent-knowledge":{"command":"agent-knowledge-server"}}}' | python3 -m json.tool > "$CLAUDE_MCP"
+        echo "  Created $CLAUDE_MCP"
+    fi
 
-# Configure session hooks in Claude Code settings
-echo "==> Configuring session hooks..."
-python3 -c "
+    echo "==> Configuring session hooks..."
+    python3 -c "
 import json, os
 
 settings_path = '$CLAUDE_SETTINGS'
@@ -85,6 +104,10 @@ else:
 with open(settings_path, 'w') as f: json.dump(data, f, indent=2)
 print(f'  {action} {settings_path}')
 "
+else
+    echo "==> Claude Code not detected (~/.claude not found) — skipping client config."
+    echo "    Configure your MCP client manually with: command = agent-knowledge-server"
+fi
 
 echo ""
 echo "Done! agent-knowledge is installed."
