@@ -110,7 +110,7 @@ def is_archived_session_path(path: str) -> bool:
 def reject_curated_write(path: str) -> str | None:
     """Return a rejection reason if `path` is in a curator-only tier, else None.
 
-    The MCP write boundary: agents may not create or update under any of
+    The agent-write boundary: agents may not create or update under any of
     `WRITE_BLOCKED_PREFIXES` (curated tiers, the wiki contract, archived drafts).
 
     `WRITE_ALLOWED_OVERRIDES` carves out narrow agent-writable paths inside
@@ -122,7 +122,7 @@ def reject_curated_write(path: str) -> str | None:
     for prefix in WRITE_BLOCKED_PREFIXES:
         if path.startswith(prefix):
             return (
-                f"MCP cannot write to `{prefix}` — curator-only. "
+                f"Cannot write to `{prefix}` — curator-only tier. "
                 f"Path rejected: {path}"
             )
     return None

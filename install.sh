@@ -7,6 +7,7 @@ set -euo pipefail
 REPO_URL="https://github.com/inotives/agent-knowledge-wikia.git"
 INSTALL_DIR="${AKW_INSTALL_DIR:-$HOME/.agent-knowledge/src}"
 HOOKS_DIR="$HOME/.agent-knowledge/hooks"
+INSTRUCTIONS_TARGET="$HOME/.agent-knowledge/akw-instructions.md"
 CLAUDE_SETTINGS="$HOME/.claude/settings.json"
 CLAUDE_MCP="$HOME/.claude/.mcp.json"
 
@@ -47,8 +48,8 @@ else
     git clone --quiet "$REPO_URL" "$INSTALL_DIR"
 fi
 
-# Install as global tool
-echo "==> Installing CLI and MCP server..."
+# Install as global tool (CLI only as of EP-00010 — MCP server removed)
+echo "==> Installing CLI..."
 uv tool install --reinstall --from "$INSTALL_DIR" agent-knowledge 2>&1 | grep -E "^Installed"
 
 # Initialize data directory and database
@@ -62,21 +63,28 @@ cp "$INSTALL_DIR/.claude/hooks/"*.sh "$HOOKS_DIR/"
 chmod +x "$HOOKS_DIR/"*.sh
 echo "  Installed $(ls "$HOOKS_DIR/"*.sh | wc -l | tr -d ' ') hooks to $HOOKS_DIR"
 
+# Install agent-knowledge session instructions (replaces the MCP `instructions` field).
+# Sourced from `akw guide` so the package is the single source of truth.
+echo "==> Installing session instructions..."
+akw guide > "$INSTRUCTIONS_TARGET"
+echo "  Installed $INSTRUCTIONS_TARGET"
+
 # Configure Claude Code only if it's already installed (~/.claude exists).
-# For other MCP clients (opencode, etc.), the user wires up MCP themselves.
+# For other clients, the user wires up their own integration.
 if [ -d "$HOME/.claude" ]; then
-    echo "==> Configuring Claude Code MCP server..."
+    # EP-00010: strip any prior `agent-knowledge` MCP entry — server is gone.
     if [ -f "$CLAUDE_MCP" ]; then
+        echo "==> Removing legacy MCP server entry (if present)..."
         python3 -c "
 import json
 with open('$CLAUDE_MCP') as f: data = json.load(f)
-data.setdefault('mcpServers', {})['agent-knowledge'] = {'command': 'agent-knowledge-server'}
-with open('$CLAUDE_MCP', 'w') as f: json.dump(data, f, indent=2)
-print('  Updated $CLAUDE_MCP')
+removed = data.get('mcpServers', {}).pop('agent-knowledge', None)
+if removed is not None:
+    with open('$CLAUDE_MCP', 'w') as f: json.dump(data, f, indent=2)
+    print('  Removed agent-knowledge from $CLAUDE_MCP')
+else:
+    print('  No legacy MCP entry to remove.')
 "
-    else
-        echo '{"mcpServers":{"agent-knowledge":{"command":"agent-knowledge-server"}}}' | python3 -m json.tool > "$CLAUDE_MCP"
-        echo "  Created $CLAUDE_MCP"
     fi
 
     echo "==> Configuring session hooks..."
@@ -86,34 +94,51 @@ import json, os
 settings_path = '$CLAUDE_SETTINGS'
 hooks_dir = '~/.agent-knowledge/hooks'
 
-hooks = {
-    'SessionStart': [{'hooks': [{'type': 'command', 'command': f'{hooks_dir}/session-start.sh'}]}],
-    'UserPromptSubmit': [{'hooks': [{'type': 'command', 'command': f'{hooks_dir}/user-prompt.sh'}]}],
-    'Stop': [{'hooks': [{'type': 'command', 'command': f'{hooks_dir}/stop.sh'}]}],
-    'SessionEnd': [{'hooks': [{'type': 'command', 'command': f'{hooks_dir}/session-end.sh'}]}],
+# Per-event akw hook entries. Each event gets its own group so existing
+# user hooks (e.g. for other tools) on the same event are preserved.
+akw_entries = {
+    'SessionStart':     {'hooks': [{'type': 'command', 'command': f'{hooks_dir}/session-start.sh'}]},
+    'UserPromptSubmit': {'hooks': [{'type': 'command', 'command': f'{hooks_dir}/user-prompt.sh'}]},
+    'Stop':             {'hooks': [{'type': 'command', 'command': f'{hooks_dir}/stop.sh'}]},
+    'SessionEnd':       {'hooks': [{'type': 'command', 'command': f'{hooks_dir}/session-end.sh'}]},
 }
 
 if os.path.exists(settings_path):
     with open(settings_path) as f: data = json.load(f)
-    data['hooks'] = hooks
     action = 'Updated'
 else:
-    data = {'hooks': hooks}
+    data = {}
     action = 'Created'
+
+hooks_root = data.setdefault('hooks', {})
+for event, akw_entry in akw_entries.items():
+    existing = hooks_root.setdefault(event, [])
+    akw_cmd = akw_entry['hooks'][0]['command']
+    # Drop any prior akw entry for this event so re-running install upgrades
+    # in place rather than duplicating.
+    pruned = []
+    for entry in existing:
+        cmds = [h.get('command', '') for h in entry.get('hooks', [])]
+        if any('agent-knowledge/hooks/' in c for c in cmds):
+            continue
+        pruned.append(entry)
+    pruned.append(akw_entry)
+    hooks_root[event] = pruned
 
 with open(settings_path, 'w') as f: json.dump(data, f, indent=2)
 print(f'  {action} {settings_path}')
 "
 else
     echo "==> Claude Code not detected (~/.claude not found) — skipping client config."
-    echo "    Configure your MCP client manually with: command = agent-knowledge-server"
+    echo "    The CLI works in any shell; configure your harness to invoke 'akw' directly."
 fi
 
 echo ""
 echo "Done! agent-knowledge is installed."
-echo "  - CLI:        akw status"
-echo "  - MCP server: agent-knowledge-server"
-echo "  - Hooks:      ~/.agent-knowledge/hooks/ (4 scripts)"
-echo "  - Project:    add AKW_PROJECT=name to your repo's .env"
+echo "  - CLI:           akw status"
+echo "  - Hooks:         ~/.agent-knowledge/hooks/ (4 scripts)"
+echo "  - Instructions:  ~/.agent-knowledge/akw-instructions.md"
+echo "  - Project:       add AKW_PROJECT=name to your repo's .env"
 echo ""
-echo "Restart Claude Code to activate."
+echo "If you upgraded from a release with the MCP server, restart Claude Code so"
+echo "the legacy 'agent-knowledge' MCP entry is fully dropped."
