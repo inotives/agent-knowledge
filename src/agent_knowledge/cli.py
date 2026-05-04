@@ -11,20 +11,120 @@ import json as json_mod
 import os
 import sys
 from datetime import datetime, timezone
+from importlib import resources
 from pathlib import Path
 
 import click
 
+from agent_knowledge import __version__
 from agent_knowledge.core.config import load_config
-from agent_knowledge.core import storage, memory, search, paths
+from agent_knowledge.core import storage, memory, search, paths, sanitizer
 
 
 # --- Top-level group ---
 
 @click.group()
+@click.version_option(__version__, "-V", "--version", prog_name="akw")
 def main():
     """Agent Knowledge — persistent memory for AI agents."""
     pass
+
+
+@main.command("guide")
+def guide_cmd():
+    """Print the akw command catalog and trigger phrases.
+
+    Single source of truth for "what can akw do?" — the same content the
+    SessionStart hook injects into Claude Code as a system reminder.
+    Reference this from a global CLAUDE.md so agents in fresh repos learn
+    the CLI surface on first contact.
+    """
+    text = resources.files("agent_knowledge").joinpath("akw_instructions.md").read_text(encoding="utf-8")
+    click.echo(text)
+
+
+# --- JSON / shared helpers ---
+
+_INTELLIGENCES_TIER_LABELS = ("skill", "agent")
+
+
+def _emit_json(payload) -> None:
+    """Emit a structured payload as pretty-printed JSON to stdout."""
+    click.echo(json_mod.dumps(payload, indent=2, default=str))
+
+
+def _build_page(title: str, content: str, tags: list[str] | None, summary: str) -> str:
+    """Build a markdown page with optional frontmatter (mirror of server-side helper)."""
+    parts: list[str] = []
+    if tags or summary:
+        parts.append("---")
+        if tags:
+            parts.append(f"tags: [{', '.join(tags)}]")
+        if summary:
+            parts.append(f"summary: {summary}")
+        parts.append("---")
+        parts.append("")
+    parts.append(f"# {title}")
+    parts.append("")
+    parts.append(content)
+    return "\n".join(parts)
+
+
+def _first_heading(content: str) -> str | None:
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("# "):
+            return stripped[2:].strip()
+    return None
+
+
+def _pending_counts(conn) -> dict:
+    """Compute the `pending` payload for `group start --json` (parity with MCP)."""
+    return {
+        "unarchived_session_drafts": storage.count_unarchived_session_drafts(conn),
+        "incomplete_segments": (
+            len(storage.get_orphaned_groups(conn))
+            + len(storage.get_closed_no_draft_segments(conn))
+        ),
+    }
+
+
+def _get_recommended_context(duckdb_conn, memory_dir: Path, project: dict | None) -> list[dict]:
+    """Resolve matching skills + recent knowledge for a project (parity with MCP)."""
+    if not project:
+        return []
+
+    candidate_paths: list[str] = []
+    for tag in project.get("tags", []) or []:
+        skill_results = search.search(duckdb_conn, tag, tier="skill")
+        candidate_paths.extend(r["path"] for r in skill_results)
+
+    knowledge = search.get_index(duckdb_conn, tier="knowledge")
+    candidate_paths.extend(r["path"] for r in knowledge[:5])
+
+    seen: set[str] = set()
+    out: list[dict] = []
+    for p in candidate_paths:
+        if p in seen:
+            continue
+        seen.add(p)
+        try:
+            content = memory.read_page(memory_dir, p)
+            out.append({"path": p, "content": content})
+        except FileNotFoundError:
+            continue
+    return out
+
+
+def _match_segment_for_draft_path(conn, group_id: str, draft_path: str) -> dict | None:
+    """Find the segment whose canonical draft path matches `draft_path`."""
+    for seg in storage.get_group_segments(conn, group_id):
+        seg_start = seg.get("segment_start_at")
+        if not seg_start:
+            continue
+        if paths.session_draft_path(group_id, seg_start) == draft_path:
+            return seg
+    return None
 
 
 # --- init / status / search / reindex ---
@@ -96,17 +196,39 @@ def status():
     conn.close()
 
 
-def _run_search(query: str, tier: str | None, domain: str | None = None) -> None:
-    """Shared search runner — used by `akw search` and the skill/agent CLI wrappers."""
+def _run_search(
+    query: str,
+    tier: str | None,
+    domain: str | None = None,
+    json_out: bool = False,
+) -> None:
+    """Shared search runner — used by `akw search` and the skill/agent CLI wrappers.
+
+    When `tier` is omitted, intelligences tiers (`skill`, `agent`) are filtered out
+    of the default ranking — matching the MCP `memory_search` contract. Pass
+    `tier="skill"` / `tier="agent"` explicitly (via `akw skill search` /
+    `akw agent search`) to scope INTO those tiers.
+    """
     config = load_config()
     if not config.memory_dir.exists():
-        click.echo("Memory folder not initialized. Run 'akw init' first.")
+        if json_out:
+            _emit_json([])
+        else:
+            click.echo("Memory folder not initialized. Run 'akw init' first.")
         return
 
     duckdb_conn = search.connect(config.search_db)
     search.sync_from_files(duckdb_conn, config.memory_dir)
 
     results = search.search(duckdb_conn, query, tier, domain_filter=domain)
+    if tier is None:
+        results = [r for r in results if r["tier"] not in _INTELLIGENCES_TIER_LABELS]
+
+    if json_out:
+        _emit_json(results)
+        duckdb_conn.close()
+        return
+
     if not results:
         click.echo("No results found.")
         duckdb_conn.close()
@@ -124,9 +246,10 @@ def _run_search(query: str, tier: str | None, domain: str | None = None) -> None
 @main.command("search")
 @click.argument("query")
 @click.option("--tier", "-t", default=None, help="Filter by tier: knowledge, skill, agent, session_draft, session_archived.")
-def search_cmd(query: str, tier: str | None):
+@click.option("--json", "json_out", is_flag=True, help="Emit results as JSON (parity with MCP memory_search).")
+def search_cmd(query: str, tier: str | None, json_out: bool):
     """Search memory from the terminal."""
-    _run_search(query, tier)
+    _run_search(query, tier, json_out=json_out)
 
 
 # --- skill / agent discovery (EP-00009) ---
@@ -142,14 +265,16 @@ main.add_command(skill)
 @skill.command("search")
 @click.argument("query")
 @click.option("--domain", "-d", default=None, help="Limit to a single domain (e.g. engineering, design).")
-def skill_search_cmd(query: str, domain: str | None):
+@click.option("--json", "json_out", is_flag=True, help="Emit results as JSON (parity with MCP skill_search).")
+def skill_search_cmd(query: str, domain: str | None, json_out: bool):
     """Search skill bundles by query."""
-    _run_search(query, tier="skill", domain=domain)
+    _run_search(query, tier="skill", domain=domain, json_out=json_out)
 
 
 @skill.command("show")
 @click.argument("skill_arg")
-def skill_show_cmd(skill_arg: str):
+@click.option("--json", "json_out", is_flag=True, help="Emit content + manifest as JSON (parity with MCP skill_get).")
+def skill_show_cmd(skill_arg: str, json_out: bool):
     """Print SKILL.md content + bundle manifest. Accepts full path or <domain>/<slug>."""
     config = load_config()
     canonical = paths.resolve_skill_path(skill_arg)
@@ -164,12 +289,28 @@ def skill_show_cmd(skill_arg: str):
         click.echo(f"Skill not found: {canonical}", err=True)
         raise SystemExit(1)
 
+    content = full.read_text(encoding="utf-8")
     bundle_dir = config.memory_dir / paths.skill_bundle_dir(canonical)
-    click.echo(f"# {domain}/{slug}\n")
-    click.echo(full.read_text(encoding="utf-8"))
+    resources = memory.list_bundle_companions(config.memory_dir, bundle_dir, "resources")
+    scripts = memory.list_bundle_companions(config.memory_dir, bundle_dir, "scripts")
+    tests = memory.list_bundle_companions(config.memory_dir, bundle_dir, "tests")
 
-    for label in ("resources", "scripts", "tests"):
-        items = memory.list_bundle_companions(config.memory_dir, bundle_dir, label)
+    if json_out:
+        _emit_json({
+            "path": canonical,
+            "domain": domain,
+            "slug": slug,
+            "title": _first_heading(content) or slug,
+            "content": content,
+            "resources": resources,
+            "scripts": scripts,
+            "tests": tests,
+        })
+        return
+
+    click.echo(f"# {domain}/{slug}\n")
+    click.echo(content)
+    for label, items in (("resources", resources), ("scripts", scripts), ("tests", tests)):
         if items:
             click.echo(f"\n## {label}/")
             for p in items:
@@ -187,14 +328,16 @@ main.add_command(agent)
 @agent.command("search")
 @click.argument("query")
 @click.option("--domain", "-d", default=None, help="Limit to a single domain (e.g. engineering, design).")
-def agent_search_cmd(query: str, domain: str | None):
+@click.option("--json", "json_out", is_flag=True, help="Emit results as JSON (parity with MCP agent_search).")
+def agent_search_cmd(query: str, domain: str | None, json_out: bool):
     """Search agent personas by query."""
-    _run_search(query, tier="agent", domain=domain)
+    _run_search(query, tier="agent", domain=domain, json_out=json_out)
 
 
 @agent.command("show")
 @click.argument("agent_arg")
-def agent_show_cmd(agent_arg: str):
+@click.option("--json", "json_out", is_flag=True, help="Emit content as JSON (parity with MCP agent_get).")
+def agent_show_cmd(agent_arg: str, json_out: bool):
     """Print agent persona file. Accepts full path or <domain>/<slug>."""
     config = load_config()
     canonical = paths.resolve_agent_path(agent_arg)
@@ -209,8 +352,20 @@ def agent_show_cmd(agent_arg: str):
         click.echo(f"Agent not found: {canonical}", err=True)
         raise SystemExit(1)
 
+    content = full.read_text(encoding="utf-8")
+
+    if json_out:
+        _emit_json({
+            "path": canonical,
+            "domain": domain,
+            "slug": slug,
+            "title": _first_heading(content) or slug,
+            "content": content,
+        })
+        return
+
     click.echo(f"# {domain}/{slug}\n")
-    click.echo(full.read_text(encoding="utf-8"))
+    click.echo(content)
 
 
 @main.command()
@@ -309,26 +464,31 @@ main.add_command(group)
 @click.option("--project", "-p", default=None, help="Project name or ID.")
 @click.option("--agent", "-a", default="claude", help="Agent name.")
 @click.option("--working-dir", default=None, help="Working directory path metadata.")
+@click.option("--json", "json_out", is_flag=True, help="Emit group_id, segment_start_at, pending counts, and recommended_context as JSON (parity with MCP group_start).")
 def group_start(
     group_id: str | None,
     project: str | None,
     agent: str,
     working_dir: str | None,
+    json_out: bool,
 ):
     """Start a new group (or continue one). Prints group_id to stdout for hook capture."""
     config = load_config()
     conn = storage.connect(config.sessions_db)
 
     project_id: str | None = None
+    project_obj: dict | None = None
     if project:
         for p in storage.list_projects(conn):
             if p["id"] == project or p["name"] == project:
                 project_id = p["id"]
+                project_obj = p
                 break
         if project_id is None:
             path = working_dir or os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd())
             new_project = storage.create_project(conn, project, path)
             project_id = new_project["id"]
+            project_obj = new_project
 
     md: dict = {"agent": agent}
     if project_id:
@@ -339,7 +499,23 @@ def group_start(
     result = storage.start_group(
         conn, group_id=group_id, agent=agent, metadata=md,
     )
-    click.echo(result["group_id"])
+
+    if json_out:
+        duckdb_conn = search.connect(config.search_db)
+        if config.memory_dir.exists():
+            search.sync_from_files(duckdb_conn, config.memory_dir)
+        payload: dict = {
+            "group_id": result["group_id"],
+            "segment_start_at": result["segment_start_at"],
+            "pending": _pending_counts(conn),
+            "recommended_context": _get_recommended_context(duckdb_conn, config.memory_dir, project_obj),
+        }
+        if result.get("idle_closed_segment"):
+            payload["idle_closed_segment"] = result["idle_closed_segment"]
+        duckdb_conn.close()
+        _emit_json(payload)
+    else:
+        click.echo(result["group_id"])
     conn.close()
 
 
@@ -368,17 +544,24 @@ def group_end(group_id: str | None):
 
 
 @group.command("status")
-def group_status():
+@click.option("--json", "json_out", is_flag=True, help="Emit status as JSON (parity with MCP group_status).")
+def group_status(json_out: bool):
     """Show the most recent open group + its segment."""
     config = load_config()
     if not config.sessions_db.exists():
-        click.echo("Not initialized. Run 'akw init' first.")
+        if json_out:
+            _emit_json({"error": "Not initialized. Run 'akw init' first."})
+        else:
+            click.echo("Not initialized. Run 'akw init' first.")
         return
 
     conn = storage.connect(config.sessions_db)
     open_groups = storage.get_open_groups(conn)
     if not open_groups:
-        click.echo("No active group.")
+        if json_out:
+            _emit_json({"group_id": None, "segment_start_at": None, "segment_turn_count": 0})
+        else:
+            click.echo("No active group.")
         conn.close()
         return
 
@@ -388,6 +571,18 @@ def group_status():
     seg_turns = storage.get_current_segment_turns(conn, gid)
     turn_count = sum(1 for t in seg_turns if t["kind"] == "turn")
     seg_start = next((t["created_at"] for t in seg_turns if t["kind"] == "start"), None)
+
+    if json_out:
+        _emit_json({
+            "group_id": gid,
+            "segment_start_at": seg_start,
+            "segment_turn_count": turn_count,
+            "agent": md.get("agent"),
+            "project_id": md.get("project_id"),
+            "latest_at": chosen["latest_at"],
+        })
+        conn.close()
+        return
 
     click.echo(f"Group:           {gid}")
     click.echo(f"Agent:           {md.get('agent', '?')}")
@@ -740,26 +935,403 @@ def recover(dry_run: bool):
     conn.close()
 
 
-# --- maintenance: purge ---
+# --- memory subcommands (parity with MCP memory_* tools) ---
 
-@main.command()
-@click.option("--older-than", default=365, help="Purge archived drafts older than N days (default: 365).")
-def purge(older_than: int):
+@main.group("memory")
+def memory_group():
+    """Memory page commands (read, create, update, rm, ls, history)."""
+
+
+main.add_command(memory_group)
+
+
+@memory_group.command("read")
+@click.argument("path")
+@click.option("--json", "json_out", is_flag=True, help="Emit {path, content} as JSON (parity with MCP memory_read).")
+def memory_read_cmd(path: str, json_out: bool):
+    """Read a memory page by relative path."""
+    config = load_config()
+    try:
+        content = memory.read_page(config.memory_dir, path)
+    except FileNotFoundError:
+        click.echo(f"Page not found: {path}", err=True)
+        raise SystemExit(1)
+
+    if json_out:
+        _emit_json({"path": path, "content": content})
+    else:
+        click.echo(content)
+
+
+@memory_group.command("create")
+@click.option("--path", "path", required=True, help="Page path. Must be under 1_drafts/ or an agent-writable carve-out.")
+@click.option("--title", required=True, help="Page title.")
+@click.option("--content", "content", default=None, help="Inline content (or use --content-file).")
+@click.option("--content-file", "content_file", type=click.Path(exists=True, dir_okay=False), default=None, help="Read content from a file instead of --content.")
+@click.option("--tags", default=None, help="Comma-separated tag list.")
+@click.option("--summary", default="", help="Short index summary.")
+@click.option("--group-id", "group_id", default=None, help="Bind the page to an originating group (used for session drafts).")
+def memory_create_cmd(
+    path: str,
+    title: str,
+    content: str | None,
+    content_file: str | None,
+    tags: str | None,
+    summary: str,
+    group_id: str | None,
+):
+    """Create a new memory page in 1_drafts/. Curated tiers are rejected."""
+    if content is None and content_file is None:
+        click.echo("Provide --content or --content-file.", err=True)
+        raise SystemExit(2)
+    if content_file:
+        content = Path(content_file).read_text(encoding="utf-8")
+    assert content is not None
+
+    rejection = paths.reject_curated_write(path)
+    if rejection:
+        click.echo(rejection, err=True)
+        raise SystemExit(1)
+
+    config = load_config()
+    redacted, _ = sanitizer.redact(content)
+    tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else None
+    page_content = _build_page(title, redacted, tag_list, summary)
+
+    try:
+        memory.create_page(config.memory_dir, path, page_content)
+    except FileExistsError:
+        click.echo(f"Page already exists: {path}", err=True)
+        raise SystemExit(1)
+
+    conn = storage.connect(config.sessions_db)
+    try:
+        tier = memory.get_tier(path) or "draft"
+        storage.create_memory_edit(
+            conn, path, tier, "create",
+            summary or f"Created {title}",
+            group_id=group_id,
+        )
+        if path.startswith(paths.SESSIONS_DIR + "/") and group_id:
+            seg = _match_segment_for_draft_path(conn, group_id, path)
+            if seg is not None:
+                storage.upsert_draft_state(
+                    conn,
+                    draft_path=path,
+                    group_id=group_id,
+                    segment_start_at=seg["segment_start_at"],
+                    segment_end_at=seg["segment_end_at"] or seg["segment_start_at"],
+                )
+    finally:
+        conn.close()
+
+    click.echo(f"Created: {path}")
+
+
+@memory_group.command("update")
+@click.argument("path")
+@click.option("--content", "content", default=None, help="New full body of the page (replaces existing content, including any frontmatter). Pair with --content-file to load from disk.")
+@click.option("--content-file", "content_file", type=click.Path(exists=True, dir_okay=False), default=None, help="Read replacement body from a file instead of --content.")
+@click.option("--summary", default="", help="Short edit summary recorded in audit history (not written to the page).")
+def memory_update_cmd(path: str, content: str | None, content_file: str | None, summary: str):
+    """Update an existing memory page (curator-side; curated tiers rejected).
+
+    --content / --content-file replaces the entire file body — there is no
+    merge with existing frontmatter. To preserve title/tags/summary lines,
+    include them in the new content.
+    """
+    if content is None and content_file is None:
+        click.echo("Provide --content or --content-file.", err=True)
+        raise SystemExit(2)
+    if content_file:
+        content = Path(content_file).read_text(encoding="utf-8")
+    assert content is not None
+
+    rejection = paths.reject_curated_write(path)
+    if rejection:
+        click.echo(rejection, err=True)
+        raise SystemExit(1)
+
+    config = load_config()
+    redacted, _ = sanitizer.redact(content)
+    try:
+        memory.update_page(config.memory_dir, path, redacted)
+    except FileNotFoundError:
+        click.echo(f"Page not found: {path}", err=True)
+        raise SystemExit(1)
+
+    conn = storage.connect(config.sessions_db)
+    try:
+        tier = memory.get_tier(path) or "draft"
+        storage.create_memory_edit(
+            conn, path, tier, "update",
+            summary or "Updated page",
+        )
+    finally:
+        conn.close()
+
+    click.echo(f"Updated: {path}")
+
+
+@memory_group.command("rm")
+@click.argument("path")
+@click.option("--reason", default="", help="Why the page is being removed (recorded in audit log).")
+def memory_rm_cmd(path: str, reason: str):
+    """Delete a memory page (or archive if it's an agent-writable carve-out)."""
+    if path.startswith(paths.DRAFTS_PREFIX):
+        click.echo(
+            "Drafts cannot be deleted via this command. The curator removes drafts via the file system.",
+            err=True,
+        )
+        raise SystemExit(1)
+
+    config = load_config()
+    conn = storage.connect(config.sessions_db)
+    duckdb_conn = search.connect(config.search_db)
+
+    try:
+        if paths.is_archive_redirected_path(path):
+            target = paths.archived_knowledge_path(path)
+            try:
+                memory.move_page(config.memory_dir, path, target)
+            except FileNotFoundError:
+                click.echo(f"Page not found: {path}", err=True)
+                raise SystemExit(1)
+            except FileExistsError:
+                click.echo(f"Archive target already exists for {path}", err=True)
+                raise SystemExit(1)
+            tier = memory.get_tier(path) or "knowledge"
+            storage.create_memory_edit(
+                conn, target, tier, "archive",
+                reason or f"Archived from {path}",
+            )
+            search.sync_from_files(duckdb_conn, config.memory_dir)
+            click.echo(f"Archived: {path} → {target}")
+            return
+
+        try:
+            memory.delete_page(config.memory_dir, path)
+        except FileNotFoundError:
+            click.echo(f"Page not found: {path}", err=True)
+            raise SystemExit(1)
+
+        tier = memory.get_tier(path) or "draft"
+        storage.create_memory_edit(conn, path, tier, "delete", reason or "Deleted page")
+        if tier in ("knowledge", "skill", "agent"):
+            search.sync_from_files(duckdb_conn, config.memory_dir)
+        click.echo(f"Deleted: {path}")
+    finally:
+        duckdb_conn.close()
+        conn.close()
+
+
+@memory_group.command("ls")
+@click.option("--tier", "-t", default=None, help="Filter by tier (knowledge, skill, agent, session_draft, ...).")
+@click.option("--json", "json_out", is_flag=True, help="Emit catalog as JSON (parity with MCP memory_index).")
+def memory_ls_cmd(tier: str | None, json_out: bool):
+    """List indexed pages (parity with MCP memory_index)."""
+    config = load_config()
+    if not config.memory_dir.exists():
+        click.echo("Memory folder not initialized. Run 'akw init' first.", err=True)
+        raise SystemExit(1)
+
+    duckdb_conn = search.connect(config.search_db)
+    search.sync_from_files(duckdb_conn, config.memory_dir)
+    rows = search.get_index(duckdb_conn, tier)
+    duckdb_conn.close()
+
+    if json_out:
+        _emit_json(rows)
+        return
+
+    if not rows:
+        click.echo("No pages indexed.")
+        return
+    for r in rows:
+        click.echo(f"  [{r['tier']}] {r['path']}")
+    click.echo(f"\n{len(rows)} pages.")
+
+
+@memory_group.command("history")
+@click.option("--page-path", "page_path", default=None, help="Limit to a single page path.")
+@click.option("--limit", default=20, help="Max rows to return.")
+@click.option("--json", "json_out", is_flag=True, help="Emit history as JSON (parity with MCP memory_history).")
+def memory_history_cmd(page_path: str | None, limit: int, json_out: bool):
+    """Show recent edit history (parity with MCP memory_history)."""
+    config = load_config()
+    if not config.sessions_db.exists():
+        click.echo("Not initialized. Run 'akw init' first.", err=True)
+        raise SystemExit(1)
+
+    conn = storage.connect(config.sessions_db)
+    rows = storage.get_memory_history(conn, limit, page_path)
+    conn.close()
+
+    if json_out:
+        _emit_json(rows)
+        return
+
+    if not rows:
+        click.echo("No edits recorded.")
+        return
+    for r in rows:
+        ts = (r.get("created_at") or "")[:19]
+        kind = r.get("edit_kind") or r.get("kind") or "?"
+        click.echo(f"[{kind:<8}] {ts} | {r.get('page_path', '?')}")
+
+
+# --- project subcommands (parity with MCP project_* tools) ---
+
+@main.group("project")
+def project_group():
+    """Project management commands."""
+
+
+main.add_command(project_group)
+
+
+@project_group.command("new")
+@click.option("--name", required=True, help="Project name.")
+@click.option("--path", "path_arg", required=True, help="Absolute path to the project root.")
+@click.option("--tags", default=None, help="Comma-separated domain tags (e.g. 'python,web').")
+def project_new_cmd(name: str, path_arg: str, tags: str | None):
+    """Register a project (parity with MCP project_create)."""
+    config = load_config()
+    conn = storage.connect(config.sessions_db)
+    tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else None
+    result = storage.create_project(conn, name, path_arg, tag_list)
+    conn.close()
+    click.echo(result["id"])
+
+
+@project_group.command("ls")
+@click.option("--json", "json_out", is_flag=True, help="Emit projects as JSON (parity with MCP project_list).")
+def project_ls_cmd(json_out: bool):
+    """List registered projects (parity with MCP project_list)."""
+    config = load_config()
+    if not config.sessions_db.exists():
+        click.echo("Not initialized. Run 'akw init' first.", err=True)
+        raise SystemExit(1)
+
+    conn = storage.connect(config.sessions_db)
+    projects = storage.list_projects(conn)
+    conn.close()
+
+    if json_out:
+        _emit_json(projects)
+        return
+
+    if not projects:
+        click.echo("No projects registered.")
+        return
+    for p in projects:
+        tags = ",".join(p.get("tags") or [])
+        click.echo(f"  {p['id'][:8]}  {p['name']:<24}  {p.get('path', '')}  [{tags}]")
+
+
+# --- maintain subcommands (parity with MCP maintain_* tools) ---
+
+@main.group("maintain")
+def maintain_group():
+    """Maintenance commands (stats, purge)."""
+
+
+main.add_command(maintain_group)
+
+
+@maintain_group.command("stats")
+@click.option("--stale-days", default=90, help="Pages older than this are reported as stale (default: 90).")
+@click.option("--json", "json_out", is_flag=True, help="Emit stats as JSON (parity with MCP maintain_get_stats).")
+def maintain_stats_cmd(stale_days: int, json_out: bool):
+    """Structural stats: page counts per tier, group stats, stale pages."""
+    config = load_config()
+    if not config.sessions_db.exists():
+        click.echo("Not initialized. Run 'akw init' first.", err=True)
+        raise SystemExit(1)
+
+    stale_cutoff = (
+        datetime.now(timezone.utc) - __import__("datetime").timedelta(days=stale_days)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    knowledge_pages = memory.list_pages(config.memory_dir, "2_knowledges")
+    skill_pages = memory.list_pages(config.memory_dir, "3_intelligences/skills")
+    agent_pages = memory.list_pages(config.memory_dir, "3_intelligences/agents")
+    draft_pages = memory.list_pages(config.memory_dir, "1_drafts")
+
+    stale: list[dict] = []
+    for pages, tier in [
+        (knowledge_pages, "knowledge"),
+        (skill_pages, "skill"),
+        (agent_pages, "agent"),
+    ]:
+        for page_path in pages:
+            full_path = config.memory_dir / page_path
+            if full_path.exists():
+                mtime = datetime.fromtimestamp(full_path.stat().st_mtime, tz=timezone.utc)
+                if mtime.strftime("%Y-%m-%dT%H:%M:%SZ") < stale_cutoff:
+                    stale.append({"path": page_path, "tier": tier, "last_modified": mtime.isoformat()})
+
+    conn = storage.connect(config.sessions_db)
+    all_groups = storage.list_groups(conn)
+    open_groups = storage.get_open_groups(conn)
+    orphans = storage.get_orphaned_groups(conn)
+    closed_no_draft = storage.get_closed_no_draft_segments(conn)
+    conn.close()
+
+    payload = {
+        "pages": {
+            "knowledge": len(knowledge_pages),
+            "skills": len(skill_pages),
+            "agents": len(agent_pages),
+            "drafts": len(draft_pages),
+        },
+        "stale_pages": stale,
+        "groups": {
+            "total": len(all_groups),
+            "open": len(open_groups),
+            "orphaned": len(orphans),
+            "closed_no_draft_segments": len(closed_no_draft),
+        },
+    }
+
+    if json_out:
+        _emit_json(payload)
+        return
+
+    click.echo(f"Pages:")
+    for k, v in payload["pages"].items():
+        click.echo(f"  {k:<10} {v}")
+    click.echo(f"Groups:")
+    for k, v in payload["groups"].items():
+        click.echo(f"  {k:<28} {v}")
+    if stale:
+        click.echo(f"Stale pages ({len(stale)} older than {stale_days} days):")
+        for s in stale[:10]:
+            click.echo(f"  [{s['tier']}] {s['path']}")
+        if len(stale) > 10:
+            click.echo(f"  ... and {len(stale) - 10} more.")
+
+
+@maintain_group.command("purge")
+@click.option("--older-than-days", "older_than_days", default=365, help="Purge archived drafts older than N days (default: 365).")
+def maintain_purge_cmd(older_than_days: int):
     """Delete archived session drafts older than the retention boundary."""
     config = load_config()
-    archive_dir = config.memory_dir / "drafts" / "archived" / "sessions"
+    archive_dir = config.memory_dir / paths.ARCHIVED_DIR
     if not archive_dir.exists():
         click.echo(f"Archive directory does not exist: {archive_dir}")
         return
 
-    cutoff = (datetime.now(timezone.utc) - __import__("datetime").timedelta(days=older_than)).timestamp()
+    cutoff = (
+        datetime.now(timezone.utc) - __import__("datetime").timedelta(days=older_than_days)
+    ).timestamp()
     purged = 0
-    for path in archive_dir.glob("**/*.md"):
-        if path.stat().st_mtime < cutoff:
-            path.unlink()
+    for p in archive_dir.glob(f"{paths.ARCHIVED_SESSION_PREFIX}*.md"):
+        if p.stat().st_mtime < cutoff:
+            p.unlink()
             purged += 1
 
-    click.echo(f"Purged {purged} archived draft(s) older than {older_than} days.")
+    click.echo(f"Purged {purged} archived draft(s) older than {older_than_days} days.")
 
 
 # --- Helpers ---

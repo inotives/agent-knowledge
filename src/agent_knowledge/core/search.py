@@ -206,9 +206,21 @@ def _extract_title(content: str, fallback: str) -> str:
 
 
 def _extract_summary(content: str) -> str:
-    """Extract first non-heading, non-empty paragraph as summary."""
-    lines = content.splitlines()
-    for line in lines:
+    """Extract a summary: prefer the frontmatter `summary:` field, else the
+    first non-heading paragraph after the frontmatter block.
+    """
+    body = content
+    if content.startswith("---"):
+        parts = content.split("---", 2)
+        if len(parts) >= 3:
+            for line in parts[1].splitlines():
+                stripped = line.strip()
+                if stripped.startswith("summary:"):
+                    value = stripped.split(":", 1)[1].strip().strip("\"'")
+                    if value:
+                        return value[:200]
+            body = parts[2]
+    for line in body.splitlines():
         stripped = line.strip()
         if stripped and not stripped.startswith("#") and not stripped.startswith("---"):
             return stripped[:200]
