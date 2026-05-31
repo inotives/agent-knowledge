@@ -201,38 +201,326 @@ def test_maintain_purge_no_archive_dir(cli_env):
     assert result.exit_code == 0
 
 
-# --- group + search --json shapes (parity with MCP) ---
+# --- session + search --json shapes ---
 
-def test_group_start_json_payload_shape(cli_env):
+def test_session_start_json_payload_shape(cli_env):
     runner, _ = cli_env
-    result = runner.invoke(main, ["group", "start", "--agent", "test", "--json"])
+    result = runner.invoke(main, [
+        "session", "start",
+        "--agent", "test",
+        "--working-dir", "/tmp/demo",
+        "--create-project-folder",
+        "--json",
+    ])
     assert result.exit_code == 0, result.output
     parsed = json.loads(result.output)
-    assert set(parsed.keys()) >= {"group_id", "segment_start_at", "pending", "recommended_context"}
-    assert set(parsed["pending"]) == {"unarchived_session_drafts", "incomplete_segments"}
-    assert isinstance(parsed["recommended_context"], list)
+    assert set(parsed.keys()) >= {"session_id", "group_id", "started_at", "project", "latest_summaries"}
+    assert parsed["session_id"] == parsed["group_id"]
+    assert parsed["project"]["name"] == "demo"
+    assert parsed["project"]["session_folder"] == "1_drafts/sessions/demo"
+    assert isinstance(parsed["latest_summaries"], list)
 
 
-def test_group_status_json_when_active(cli_env):
+def test_session_start_stores_home_relative_project_path(cli_env, monkeypatch):
+    runner, data_dir = cli_env
+    home = data_dir / "home"
+    project_dir = home / "work" / "demo"
+    project_dir.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+
+    result = runner.invoke(main, [
+        "session", "start",
+        "--agent", "test",
+        "--working-dir", str(project_dir),
+        "--create-project-folder",
+        "--json",
+    ])
+    assert result.exit_code == 0, result.output
+    parsed = json.loads(result.output)
+    assert parsed["project"]["path"] == "~/work/demo"
+
+    close = runner.invoke(main, [
+        "session", "close",
+        "--session-id", parsed["session_id"],
+        "--content", "# Session Summary\n\n## Requests And Prompts\n\nHome path test.",
+        "--json",
+    ])
+    assert close.exit_code == 0, close.output
+    closed = json.loads(close.output)
+    assert 'working_dir: "~/work/demo"' in closed["content"]
+
+
+def test_session_start_requires_project_folder_by_default(cli_env):
     runner, _ = cli_env
-    start = runner.invoke(main, ["group", "start", "--agent", "test", "--json"])
+    result = runner.invoke(main, [
+        "session", "start",
+        "--agent", "test",
+        "--working-dir", "/tmp/demo",
+        "--json",
+    ])
+    assert result.exit_code == 1
+    assert "Project session folder missing: 1_drafts/sessions/demo" in result.output
+    assert "--create-project-folder" in result.output
+
+
+def test_session_status_json_when_active(cli_env):
+    runner, _ = cli_env
+    start = runner.invoke(main, ["session", "start", "--agent", "test", "--create-project-folder", "--json"])
     assert start.exit_code == 0
     gid = json.loads(start.output)["group_id"]
 
-    status = runner.invoke(main, ["group", "status", "--json"])
+    status = runner.invoke(main, ["session", "status", "--json"])
     assert status.exit_code == 0
     parsed = json.loads(status.output)
     assert parsed["group_id"] == gid
+    assert parsed["session_id"] == gid
     assert "segment_start_at" in parsed
     assert "segment_turn_count" in parsed
 
 
-def test_group_status_json_no_active_group(cli_env):
+def test_session_status_json_no_active_session(cli_env):
     runner, _ = cli_env
-    result = runner.invoke(main, ["group", "status", "--json"])
+    result = runner.invoke(main, ["session", "status", "--json"])
     assert result.exit_code == 0
     parsed = json.loads(result.output)
     assert parsed["group_id"] is None
+
+
+def test_session_close_writes_summary_and_recent_returns_full_content(cli_env):
+    runner, data_dir = cli_env
+    start = runner.invoke(
+        main,
+        [
+            "session", "start",
+            "--agent", "test",
+            "--project", "demo",
+            "--working-dir", "/tmp/demo",
+            "--create-project-folder",
+            "--json",
+        ],
+    )
+    assert start.exit_code == 0, start.output
+    start_payload = json.loads(start.output)
+    session_id = start_payload["session_id"]
+    project_id = start_payload["project"]["id"]
+
+    summary = """# Session Summary
+
+## Requests And Prompts
+
+Build the session workflow.
+
+## Work Performed
+
+Implemented close and recent commands.
+
+## Discoveries And Insights
+
+Recent summaries need full content.
+
+## Completed Changes
+
+Added storage and CLI support.
+
+## Follow-Up And Next Steps
+
+Run the full test suite.
+
+## Additional Context
+
+Project-scoped.
+"""
+    close = runner.invoke(
+        main,
+        ["session", "close", "--session-id", session_id, "--content", summary, "--json"],
+    )
+    assert close.exit_code == 0, close.output
+    closed = json.loads(close.output)
+    assert closed["session_id"] == session_id
+    assert "Implemented close and recent commands." in closed["content"]
+    assert (data_dir / "memory" / closed["path"]).exists()
+
+    recent = runner.invoke(main, ["session", "recent", "--project", "demo", "--json"])
+    assert recent.exit_code == 0, recent.output
+    payload = json.loads(recent.output)
+    assert len(payload) == 1
+    assert payload[0]["session_id"] == session_id
+    assert "Recent summaries need full content." in payload[0]["content"]
+
+    curated_dir = data_dir / "memory" / "2_knowledges" / "entities" / "projects" / project_id / "sessions"
+    curated_dir.mkdir(parents=True)
+    curated = curated_dir / "curated-session.md"
+    curated.write_text(
+        """---
+summary: Curated project session
+tags: [session]
+project_id: {project_id}
+project_name: demo
+session_id: curated-session
+created_at: 2026-05-31T10:00:00Z
+ended_at: 2026-05-31T10:00:00Z
+---
+
+# Curated Session
+
+Curated session body.
+""".format(project_id=project_id),
+        encoding="utf-8",
+    )
+
+    with_curated = runner.invoke(main, ["session", "recent", "--project", "demo", "--json"])
+    assert with_curated.exit_code == 0, with_curated.output
+    merged = json.loads(with_curated.output)
+    paths = {item["path"] for item in merged}
+    assert closed["path"] in paths
+    assert f"2_knowledges/entities/projects/{project_id}/sessions/curated-session.md" in paths
+    curated_item = next(item for item in merged if item["session_id"] == "curated-session")
+    assert "Curated session body." in curated_item["content"]
+    assert curated_item["metadata"]["source"] == "knowledge"
+
+    slug_curated_dir = data_dir / "memory" / "2_knowledges" / "entities" / "projects" / "demo" / "sessions"
+    slug_curated_dir.mkdir(parents=True)
+    slug_curated = slug_curated_dir / "slug-curated-session.md"
+    slug_curated.write_text(
+        """---
+summary: Slug curated project session
+tags: [session]
+project_name: demo
+session_id: slug-curated-session
+created_at: 2026-05-31T11:00:00Z
+ended_at: 2026-05-31T11:00:00Z
+---
+
+# Slug Curated Session
+
+Slug curated session body.
+""",
+        encoding="utf-8",
+    )
+    with_slug_curated = runner.invoke(main, ["session", "recent", "--project", "demo", "--json"])
+    assert with_slug_curated.exit_code == 0, with_slug_curated.output
+    slug_merged = json.loads(with_slug_curated.output)
+    slug_paths = {item["path"] for item in slug_merged}
+    assert "2_knowledges/entities/projects/demo/sessions/slug-curated-session.md" in slug_paths
+
+
+def test_session_recent_omits_missing_rows_covered_by_merged_draft(cli_env):
+    runner, data_dir = cli_env
+    start_a = runner.invoke(main, [
+        "session", "start",
+        "--project", "demo",
+        "--working-dir", "/tmp/demo",
+        "--create-project-folder",
+        "--json",
+    ])
+    assert start_a.exit_code == 0, start_a.output
+    session_a = json.loads(start_a.output)["session_id"]
+    close_a = runner.invoke(main, [
+        "session", "close",
+        "--session-id", session_a,
+        "--content", "# Session Summary\n\n## Requests And Prompts\n\nFirst.",
+        "--json",
+    ])
+    assert close_a.exit_code == 0, close_a.output
+    path_a = json.loads(close_a.output)["path"]
+
+    start_b = runner.invoke(main, [
+        "session", "start",
+        "--project", "demo",
+        "--working-dir", "/tmp/demo",
+        "--json",
+    ])
+    assert start_b.exit_code == 0, start_b.output
+    session_b = json.loads(start_b.output)["session_id"]
+    close_b = runner.invoke(main, [
+        "session", "close",
+        "--session-id", session_b,
+        "--content", "# Session Summary\n\n## Requests And Prompts\n\nMerged.",
+        "--json",
+    ])
+    assert close_b.exit_code == 0, close_b.output
+    payload_b = json.loads(close_b.output)
+    path_b = payload_b["path"]
+
+    file_a = data_dir / "memory" / path_a
+    file_a.unlink()
+    file_b = data_dir / "memory" / path_b
+    content_b = file_b.read_text(encoding="utf-8")
+    content_b = content_b.replace(
+        f'session_id: "{session_b}"',
+        f'session_ids: ["{session_a}", "{session_b}"]',
+    )
+    file_b.write_text(content_b, encoding="utf-8")
+
+    recent = runner.invoke(main, ["session", "recent", "--project", "demo", "--json"])
+    assert recent.exit_code == 0, recent.output
+    payload = json.loads(recent.output)
+    ids = [item["session_id"] for item in payload]
+    paths = [item["path"] for item in payload]
+    assert session_a not in ids
+    assert path_a not in paths
+    assert path_b in paths
+
+
+def test_session_start_recent_excludes_current_open_session(cli_env):
+    runner, _ = cli_env
+    first = runner.invoke(main, [
+        "session", "start",
+        "--project", "demo",
+        "--working-dir", "/tmp/demo",
+        "--create-project-folder",
+        "--json",
+    ])
+    first_id = json.loads(first.output)["session_id"]
+    close = runner.invoke(main, [
+        "session", "close",
+        "--session-id", first_id,
+        "--content", "# Session Summary\n\n## Requests And Prompts\n\nFirst saved session.",
+        "--json",
+    ])
+    assert close.exit_code == 0, close.output
+
+    second = runner.invoke(main, ["session", "start", "--project", "demo", "--working-dir", "/tmp/demo", "--json"])
+    parsed = json.loads(second.output)
+    assert parsed["session_id"] != first_id
+    ids = [item["session_id"] for item in parsed["latest_summaries"]]
+    assert first_id in ids
+    assert parsed["session_id"] not in ids
+
+
+def test_group_end_requires_session_summary(cli_env):
+    runner, _ = cli_env
+    result = runner.invoke(main, ["group", "end"])
+    assert result.exit_code == 1
+    assert "Session summary required" in result.output
+
+
+def test_group_lifecycle_commands_remain_legacy_aliases(cli_env):
+    runner, _ = cli_env
+    start = runner.invoke(main, [
+        "group", "start",
+        "--project", "demo",
+        "--working-dir", "/tmp/demo",
+        "--create-project-folder",
+        "--json",
+    ])
+    assert start.exit_code == 0, start.output
+    session_id = json.loads(start.output)["session_id"]
+
+    status = runner.invoke(main, ["group", "status", "--json"])
+    assert status.exit_code == 0, status.output
+    assert json.loads(status.output)["session_id"] == session_id
+
+    close = runner.invoke(
+        main,
+        [
+            "group", "close",
+            "--session-id", session_id,
+            "--content", "# Session Summary\n\n## Requests And Prompts\n\nAlias path.",
+            "--json",
+        ],
+    )
+    assert close.exit_code == 0, close.output
 
 
 def test_search_json_excludes_intelligences_by_default(cli_env):

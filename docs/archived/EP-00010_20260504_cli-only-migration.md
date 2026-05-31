@@ -167,6 +167,6 @@ Add a global `--json` flag (or per-subcommand where the human-readable form is m
 
 _(none yet — to be filled in during review)_
 
-## Status: IN REVIEW
+## Status: DONE
 
 Implementation landed on `feat/ep-00010-cli-only-migration`. Tests: **136 passing** (117 pre-existing core tests + 19 new CLI smoke tests in `tests/test_cli.py`). MCP server (`src/agent_knowledge/server.py`, 798 lines) deleted; `agent-knowledge-server` removed from `pyproject.toml`; `mcp` runtime dep dropped; package bumped to `0.2.0`. Install script strips legacy `~/.claude/.mcp.json` entries idempotently and copies `akw-instructions.md` into `~/.agent-knowledge/`. SessionStart hook now prints the instructions to stderr. README / SPECS rewritten to drop MCP-transport language; `docs/MCP_TO_CLI_MIGRATION.md` provides the per-tool mapping for downstream consumers.

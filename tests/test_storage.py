@@ -24,6 +24,61 @@ class TestProjects:
         assert storage.get_project(tmp_db, "nonexistent") is None
 
 
+class TestSessionSummaries:
+    def test_start_and_close_session(self, tmp_db):
+        session = storage.start_session(
+            tmp_db,
+            project_id="p1",
+            project_name="Project One",
+            agent="codex",
+            working_dir="/tmp/project-one",
+        )
+        assert session["id"]
+        assert session["ended_at"] is None
+
+        open_session = storage.get_open_session(tmp_db, session["id"])
+        assert open_session is not None
+        assert open_session["project_name"] == "Project One"
+
+        closed = storage.close_session(
+            tmp_db,
+            session["id"],
+            draft_path="1_drafts/sessions/p1.md",
+            title="Session Summary",
+            summary="Did useful work",
+            ended_at="2026-05-30T01:00:00Z",
+        )
+        assert closed is not None
+        assert closed["ended_at"] == "2026-05-30T01:00:00Z"
+        assert storage.get_open_session(tmp_db, session["id"]) is None
+
+    def test_recent_summaries_are_project_scoped_and_exclude_current(self, tmp_db):
+        older = storage.start_session(tmp_db, "p1", "Project One", "codex")
+        storage.close_session(
+            tmp_db, older["id"], "1_drafts/sessions/old.md", "Old", "Old summary",
+            ended_at="2026-05-30T01:00:00Z",
+        )
+        newer = storage.start_session(tmp_db, "p1", "Project One", "codex")
+        storage.close_session(
+            tmp_db, newer["id"], "1_drafts/sessions/new.md", "New", "New summary",
+            ended_at="2026-05-30T02:00:00Z",
+        )
+        other = storage.start_session(tmp_db, "p2", "Project Two", "codex")
+        storage.close_session(
+            tmp_db, other["id"], "1_drafts/sessions/other.md", "Other", "Other summary",
+            ended_at="2026-05-30T03:00:00Z",
+        )
+        current = storage.start_session(tmp_db, "p1", "Project One", "codex")
+
+        recent = storage.list_recent_session_summaries(
+            tmp_db,
+            project_id="p1",
+            limit=5,
+            exclude_session_id=current["id"],
+        )
+        assert [r["id"] for r in recent] == [newer["id"], older["id"]]
+
+
 class TestGroupLifecycle:
     def test_start_and_end(self, tmp_db):
         result = storage.start_group(tmp_db, agent="claude", metadata={"project_id": "p1"})

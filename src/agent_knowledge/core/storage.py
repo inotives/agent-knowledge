@@ -1,4 +1,4 @@
-"""SQLite storage — CRUD for projects, groups (via marker turns), turns, memory_edits.
+"""SQLite storage — CRUD for projects, session summaries, groups, turns, memory_edits.
 
 EP-00005: groups replace sessions. A group is a sequence of segments (start→end pairs)
 sharing the same group_id. State lives entirely in `turns` via marker rows
@@ -124,6 +124,30 @@ _MIGRATIONS: list[str] = [
     CREATE INDEX idx_memory_edits_page_path ON memory_edits(page_path);
     CREATE INDEX idx_memory_edits_tier ON memory_edits(tier);
     """,
+    # v4: EP-00011 — session summaries are the durable session unit.
+    """
+    CREATE TABLE IF NOT EXISTS session_summaries (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        project_name TEXT NOT NULL,
+        agent TEXT NOT NULL,
+        working_dir TEXT,
+        draft_path TEXT UNIQUE,
+        title TEXT NOT NULL DEFAULT 'Session Summary',
+        summary TEXT NOT NULL DEFAULT '',
+        metadata TEXT NOT NULL DEFAULT '{}',
+        started_at TEXT NOT NULL,
+        ended_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_session_summaries_project_id_ended
+        ON session_summaries(project_id, ended_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_session_summaries_project_name_ended
+        ON session_summaries(project_name, ended_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_session_summaries_draft_path
+        ON session_summaries(draft_path);
+    """,
 ]
 
 
@@ -166,6 +190,129 @@ def get_project(conn: sqlite3.Connection, project_id: str) -> dict | None:
 
 def list_projects(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute("SELECT * FROM projects ORDER BY created_at DESC").fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
+# --- Session summaries (EP-00011) ---
+
+def start_session(
+    conn: sqlite3.Connection,
+    project_id: str,
+    project_name: str,
+    agent: str = "unknown",
+    working_dir: str | None = None,
+    metadata: dict | None = None,
+    session_id: str | None = None,
+) -> dict:
+    """Open a new session-summary record and return it."""
+    sid = session_id or _uuid()
+    started_at = _now_iso()
+    conn.execute(
+        """INSERT INTO session_summaries
+           (id, project_id, project_name, agent, working_dir, metadata, started_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            sid,
+            project_id,
+            project_name,
+            agent,
+            working_dir,
+            json.dumps(metadata or {}),
+            started_at,
+        ),
+    )
+    conn.commit()
+    session = get_open_session(conn, sid)
+    assert session is not None
+    return session
+
+
+def close_session(
+    conn: sqlite3.Connection,
+    session_id: str,
+    draft_path: str,
+    title: str,
+    summary: str,
+    ended_at: str | None = None,
+    metadata: dict | None = None,
+) -> dict | None:
+    """Close a session with its durable summary draft.
+
+    Idempotency is intentionally strict: an already-closed session is returned
+    unchanged so callers can detect that no new draft should be written.
+    """
+    current = get_session(conn, session_id)
+    if current is None:
+        return None
+    if current.get("ended_at"):
+        return current
+
+    md = dict(current.get("metadata") or {})
+    md.update(metadata or {})
+    end_ts = ended_at or _now_iso()
+    conn.execute(
+        """UPDATE session_summaries
+           SET draft_path = ?, title = ?, summary = ?, ended_at = ?, metadata = ?
+           WHERE id = ?""",
+        (draft_path, title, summary, end_ts, json.dumps(md), session_id),
+    )
+    conn.commit()
+    return get_session(conn, session_id)
+
+
+def get_session(conn: sqlite3.Connection, session_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM session_summaries WHERE id = ?", (session_id,)
+    ).fetchone()
+    return _row_to_dict(row) if row else None
+
+
+def get_open_session(
+    conn: sqlite3.Connection,
+    session_id: str | None = None,
+    latest: bool = False,
+) -> dict | None:
+    if session_id:
+        row = conn.execute(
+            "SELECT * FROM session_summaries WHERE id = ? AND ended_at IS NULL",
+            (session_id,),
+        ).fetchone()
+    elif latest:
+        row = conn.execute(
+            "SELECT * FROM session_summaries WHERE ended_at IS NULL "
+            "ORDER BY started_at DESC, rowid DESC LIMIT 1"
+        ).fetchone()
+    else:
+        return None
+    return _row_to_dict(row) if row else None
+
+
+def list_recent_session_summaries(
+    conn: sqlite3.Connection,
+    project_id: str | None = None,
+    project_name: str | None = None,
+    limit: int = 5,
+    exclude_session_id: str | None = None,
+) -> list[dict]:
+    """List closed session summaries for one project, newest first."""
+    where = ["ended_at IS NOT NULL"]
+    params: list = []
+    if project_id:
+        where.append("project_id = ?")
+        params.append(project_id)
+    elif project_name:
+        where.append("project_name = ?")
+        params.append(project_name)
+    if exclude_session_id:
+        where.append("id != ?")
+        params.append(exclude_session_id)
+    params.append(limit)
+    rows = conn.execute(
+        "SELECT * FROM session_summaries WHERE "
+        + " AND ".join(where)
+        + " ORDER BY ended_at DESC, rowid DESC LIMIT ?",
+        params,
+    ).fetchall()
     return [_row_to_dict(r) for r in rows]
 
 
@@ -815,11 +962,12 @@ def reindex_draft_state(
             reconciled += 1
 
     if existing_count == 0 or force:
-        live_paths = list(sessions_dir.glob("*.md")) if sessions_dir.exists() else []
+        live_paths = list(sessions_dir.rglob("*.md")) if sessions_dir.exists() else []
         archived_paths = list(memory_dir.glob(_paths.ARCHIVED_SESSION_GLOB))
         for path, archived in [(p, False) for p in live_paths] + [(p, True) for p in archived_paths]:
             fm = _parse_frontmatter(path.read_text())
-            if not fm or "group_id" not in fm:
+            group_id = fm.get("group_id") or fm.get("session_id")
+            if not fm or not group_id:
                 continue
             relative = str(path.relative_to(memory_dir))
             conn.execute(
@@ -833,9 +981,9 @@ def reindex_draft_state(
                        archived_at = excluded.archived_at""",
                 (
                     relative,
-                    fm.get("group_id", ""),
-                    fm.get("segment_start_at", ""),
-                    fm.get("segment_end_at", ""),
+                    group_id,
+                    fm.get("segment_start_at") or fm.get("started_at", ""),
+                    fm.get("segment_end_at") or fm.get("ended_at", ""),
                     fm.get("created_at", _now_iso()),
                     _now_iso() if archived else None,
                 ),

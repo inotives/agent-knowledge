@@ -59,6 +59,7 @@ akw init
 # Install hook scripts
 echo "==> Installing hooks..."
 mkdir -p "$HOOKS_DIR"
+rm -f "$HOOKS_DIR/user-prompt.sh" "$HOOKS_DIR/stop.sh"
 cp "$INSTALL_DIR/.claude/hooks/"*.sh "$HOOKS_DIR/"
 chmod +x "$HOOKS_DIR/"*.sh
 echo "  Installed $(ls "$HOOKS_DIR/"*.sh | wc -l | tr -d ' ') hooks to $HOOKS_DIR"
@@ -98,8 +99,6 @@ hooks_dir = '~/.agent-knowledge/hooks'
 # user hooks (e.g. for other tools) on the same event are preserved.
 akw_entries = {
     'SessionStart':     {'hooks': [{'type': 'command', 'command': f'{hooks_dir}/session-start.sh'}]},
-    'UserPromptSubmit': {'hooks': [{'type': 'command', 'command': f'{hooks_dir}/user-prompt.sh'}]},
-    'Stop':             {'hooks': [{'type': 'command', 'command': f'{hooks_dir}/stop.sh'}]},
     'SessionEnd':       {'hooks': [{'type': 'command', 'command': f'{hooks_dir}/session-end.sh'}]},
 }
 
@@ -111,6 +110,19 @@ else:
     action = 'Created'
 
 hooks_root = data.setdefault('hooks', {})
+for stale_event in ('UserPromptSubmit', 'Stop'):
+    existing = hooks_root.get(stale_event, [])
+    pruned = []
+    for entry in existing:
+        cmds = [h.get('command', '') for h in entry.get('hooks', [])]
+        if any('agent-knowledge/hooks/' in c for c in cmds):
+            continue
+        pruned.append(entry)
+    if pruned:
+        hooks_root[stale_event] = pruned
+    else:
+        hooks_root.pop(stale_event, None)
+
 for event, akw_entry in akw_entries.items():
     existing = hooks_root.setdefault(event, [])
     akw_cmd = akw_entry['hooks'][0]['command']
@@ -136,7 +148,7 @@ fi
 echo ""
 echo "Done! agent-knowledge is installed."
 echo "  - CLI:           akw status"
-echo "  - Hooks:         ~/.agent-knowledge/hooks/ (4 scripts)"
+echo "  - Hooks:         ~/.agent-knowledge/hooks/ (2 scripts)"
 echo "  - Instructions:  ~/.agent-knowledge/akw-instructions.md"
 echo "  - Project:       add AKW_PROJECT=name to your repo's .env"
 echo ""

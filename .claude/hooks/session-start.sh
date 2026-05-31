@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SessionStart — start group, persist GROUP_ID, read project from .env, inject akw instructions
+# SessionStart — start session, persist session id, inject akw instructions and recent summaries
 set -euo pipefail
 case "${CLAUDE_PROJECT_DIR:-}" in */.agent-knowledge/memory*) exit 0;; esac
 
@@ -12,8 +12,15 @@ fi
 WD_FLAG=""
 [ -n "${CLAUDE_PROJECT_DIR:-}" ] && WD_FLAG="--working-dir $CLAUDE_PROJECT_DIR"
 
-GROUP_ID=$(akw group start --agent claude $PROJECT_FLAG $WD_FLAG 2>/dev/null) || exit 0
-[ -n "${CLAUDE_ENV_FILE:-}" ] && [ -n "$GROUP_ID" ] && echo "export AKW_GROUP_ID=$GROUP_ID" >> "$CLAUDE_ENV_FILE"
+if ! START_JSON=$(akw session start --agent claude $PROJECT_FLAG $WD_FLAG --json 2>&1); then
+    printf '%s\n' "$START_JSON" >&2
+    exit 1
+fi
+SESSION_ID=$(printf '%s' "$START_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null) || SESSION_ID=""
+if [ -n "${CLAUDE_ENV_FILE:-}" ] && [ -n "$SESSION_ID" ]; then
+    echo "export AKW_SESSION_ID=$SESSION_ID" >> "$CLAUDE_ENV_FILE"
+    echo "export AKW_GROUP_ID=$SESSION_ID" >> "$CLAUDE_ENV_FILE"
+fi
 
 # EP-00010: print agent-knowledge usage instructions to stderr so Claude Code
 # surfaces them as a system reminder. Replaces the MCP server's `instructions`
@@ -24,6 +31,11 @@ if [ -f "$INSTRUCTIONS_FILE" ]; then
     cat "$INSTRUCTIONS_FILE" >&2
 else
     akw guide >&2 2>/dev/null || true
+fi
+
+if [ -n "$START_JSON" ]; then
+    printf '\n# Recent Agent Knowledge Session Summaries\n\n' >&2
+    printf '%s\n' "$START_JSON" >&2
 fi
 
 exit 0

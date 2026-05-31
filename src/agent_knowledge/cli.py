@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json as json_mod
 import os
-import sys
+import re
 from datetime import datetime, timezone
 from importlib import resources
 from pathlib import Path
@@ -78,42 +78,341 @@ def _first_heading(content: str) -> str | None:
     return None
 
 
-def _pending_counts(conn) -> dict:
-    """Compute the `pending` payload for `group start --json` (parity with MCP)."""
-    return {
-        "unarchived_session_drafts": storage.count_unarchived_session_drafts(conn),
-        "incomplete_segments": (
-            len(storage.get_orphaned_groups(conn))
-            + len(storage.get_closed_no_draft_segments(conn))
-        ),
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
+    return slug or "project"
+
+
+def _read_env_project(working_dir: str | None) -> str | None:
+    if not working_dir:
+        return None
+    env_path = Path(working_dir) / ".env"
+    if not env_path.exists():
+        return None
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("AKW_PROJECT="):
+            continue
+        value = line.split("=", 1)[1].strip().strip("\"'")
+        return value or None
+    return None
+
+
+def _is_path_within(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _display_path(path: str | None) -> str:
+    if not path:
+        return ""
+    expanded = Path(path).expanduser()
+    try:
+        home = Path.home().resolve()
+        resolved = expanded.resolve()
+        if resolved == home:
+            return "~"
+        return f"~/{resolved.relative_to(home)}"
+    except (OSError, ValueError):
+        return path
+
+
+def _ensure_project_entity_page(config, conn, project: dict) -> None:
+    """Create a project entity page when auto-registering a project."""
+    slug = _slugify(project["name"])
+    rel_path = f"2_knowledges/entities/projects/{slug}.md"
+    full_path = config.memory_dir / rel_path
+    if full_path.exists():
+        return
+    content = (
+        "---\n"
+        f"summary: Project entity for {project['name']}\n"
+        "tags: [project]\n"
+        f"project_id: {project['id']}\n"
+        f"path: {project.get('path', '')}\n"
+        f"created_at: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+        "---\n\n"
+        f"# {project['name']}\n\n"
+        f"- Project ID: `{project['id']}`\n"
+        f"- Path: `{project.get('path', '')}`\n"
+    )
+    memory.create_page(config.memory_dir, rel_path, content)
+    storage.create_memory_edit(
+        conn,
+        rel_path,
+        "knowledge",
+        "create",
+        f"Created project entity for {project['name']}",
+    )
+
+
+def _project_session_folder_name(project: dict) -> str:
+    metadata = project.get("metadata") or {}
+    if isinstance(metadata, dict) and metadata.get("session_folder"):
+        return _slugify(str(metadata["session_folder"]))
+    return _slugify(project.get("name") or project.get("id") or "project")
+
+
+def _project_session_folder_path(project: dict) -> str:
+    return f"{paths.SESSIONS_DIR}/{_project_session_folder_name(project)}"
+
+
+def _ensure_project_session_folder(config, project: dict, create: bool) -> str:
+    rel_path = _project_session_folder_path(project)
+    full_path = config.memory_dir / rel_path
+    if full_path.exists():
+        if not full_path.is_dir():
+            click.echo(f"Project session path exists but is not a directory: {rel_path}", err=True)
+            raise SystemExit(1)
+        return rel_path
+    if create:
+        full_path.mkdir(parents=True, exist_ok=True)
+        return rel_path
+
+    click.echo(
+        "\n".join([
+            f"Project session folder missing: {rel_path}",
+            f"Default folder name: {_project_session_folder_name(project)}",
+            "Create it, then start again:",
+            f"  mkdir -p {rel_path}",
+            "Or let akw create it:",
+            "  akw session start --create-project-folder",
+        ]),
+        err=True,
+    )
+    raise SystemExit(1)
+
+
+def _resolve_project(config, conn, project: str | None, working_dir: str | None) -> dict:
+    """Resolve or create the active project for a session."""
+    wd = working_dir or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    explicit = _read_env_project(wd) or project
+    projects = storage.list_projects(conn)
+
+    if explicit:
+        for p in projects:
+            if p["id"] == explicit or p["name"] == explicit:
+                return p
+
+    wd_path = Path(wd)
+    matches = [
+        p for p in projects
+        if p.get("path") and _is_path_within(wd_path, Path(p["path"]))
+    ]
+    if matches:
+        return max(matches, key=lambda p: len(str(Path(p["path"]).resolve())))
+
+    name = explicit or wd_path.resolve().name
+    project_obj = storage.create_project(conn, name, _display_path(str(wd_path.resolve())))
+    _ensure_project_entity_page(config, conn, project_obj)
+    return project_obj
+
+
+def _session_summary_payload(config, row: dict, include_content: bool = True) -> dict:
+    payload = {
+        "session_id": row["id"],
+        "path": row.get("draft_path"),
+        "title": row.get("title"),
+        "summary": row.get("summary"),
+        "created_at": row.get("created_at"),
+        "started_at": row.get("started_at"),
+        "ended_at": row.get("ended_at"),
+        "metadata": row.get("metadata") or {},
     }
-
-
-def _get_recommended_context(duckdb_conn, memory_dir: Path, project: dict | None) -> list[dict]:
-    """Resolve matching skills + recent knowledge for a project (parity with MCP)."""
-    if not project:
-        return []
-
-    candidate_paths: list[str] = []
-    for tag in project.get("tags", []) or []:
-        skill_results = search.search(duckdb_conn, tag, tier="skill")
-        candidate_paths.extend(r["path"] for r in skill_results)
-
-    knowledge = search.get_index(duckdb_conn, tier="knowledge")
-    candidate_paths.extend(r["path"] for r in knowledge[:5])
-
-    seen: set[str] = set()
-    out: list[dict] = []
-    for p in candidate_paths:
-        if p in seen:
-            continue
-        seen.add(p)
+    if include_content and row.get("draft_path"):
         try:
-            content = memory.read_page(memory_dir, p)
-            out.append({"path": p, "content": content})
+            payload["content"] = memory.read_page(config.memory_dir, row["draft_path"])
         except FileNotFoundError:
+            payload["content"] = None
+    return payload
+
+
+def _parse_simple_frontmatter(content: str) -> dict:
+    if not content.startswith("---"):
+        return {}
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        return {}
+    out: dict = {}
+    for line in parts[1].splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or ":" not in line:
             continue
+        key, _, value = line.partition(":")
+        out[key.strip()] = value.strip().strip("\"'")
     return out
+
+
+def _curated_project_sessions_dirs(project: dict) -> list[str]:
+    candidates = [
+        f"2_knowledges/entities/projects/{project['id']}/sessions",
+        f"2_knowledges/entities/projects/{_slugify(project['name'])}/sessions",
+    ]
+    seen: set[str] = set()
+    out: list[str] = []
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        out.append(candidate)
+    return out
+
+
+def _session_ids_from_frontmatter_value(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return re.findall(r"[0-9a-fA-F]{12,}", value)
+
+
+def _session_payload_from_file(
+    config,
+    project: dict,
+    md_file: Path,
+    source: str,
+    include_content: bool = True,
+) -> dict:
+    rel_path = str(md_file.relative_to(config.memory_dir))
+    content = md_file.read_text(encoding="utf-8")
+    fm = _parse_simple_frontmatter(content)
+    title = _first_heading(content) or md_file.stem
+    updated_at = datetime.fromtimestamp(
+        md_file.stat().st_mtime,
+        tz=timezone.utc,
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    payload = {
+        "session_id": fm.get("session_id") or md_file.stem,
+        "session_ids": _session_ids_from_frontmatter_value(fm.get("session_ids")),
+        "path": rel_path,
+        "title": title,
+        "summary": fm.get("summary", ""),
+        "created_at": fm.get("created_at") or updated_at,
+        "started_at": fm.get("started_at"),
+        "ended_at": fm.get("ended_at") or fm.get("created_at") or updated_at,
+        "metadata": {
+            "project_id": fm.get("project_id") or project["id"],
+            "project_name": fm.get("project_name") or project["name"],
+            "source": source,
+        },
+    }
+    if include_content:
+        payload["content"] = content
+    return payload
+
+
+def _draft_project_session_payloads(config, project: dict, include_content: bool = True) -> list[dict]:
+    session_folder = _project_session_folder_path(project)
+    full_dir = config.memory_dir / session_folder
+    if not full_dir.exists() or not full_dir.is_dir():
+        return []
+    return [
+        _session_payload_from_file(config, project, md_file, "draft", include_content)
+        for md_file in sorted(full_dir.rglob("*.md"))
+    ]
+
+
+def _curated_session_payloads(config, project: dict, include_content: bool = True) -> list[dict]:
+    payloads: list[dict] = []
+    for rel_dir in _curated_project_sessions_dirs(project):
+        full_dir = config.memory_dir / rel_dir
+        if not full_dir.exists() or not full_dir.is_dir():
+            continue
+        payloads.extend(
+            _session_payload_from_file(config, project, md_file, "knowledge", include_content)
+            for md_file in sorted(full_dir.rglob("*.md"))
+        )
+    return payloads
+
+
+def _recent_session_payloads(
+    config,
+    conn,
+    project: dict,
+    limit: int,
+    exclude_session_id: str | None = None,
+) -> list[dict]:
+    draft_rows = storage.list_recent_session_summaries(
+        conn,
+        project_id=project["id"],
+        limit=limit,
+        exclude_session_id=exclude_session_id,
+    )
+    row_payloads = [
+        _session_summary_payload(config, row, include_content=True)
+        for row in draft_rows
+    ]
+    row_payloads = [
+        payload for payload in row_payloads
+        if payload.get("content") is not None
+    ]
+    for payload in row_payloads:
+        payload.setdefault("metadata", {})
+        payload["metadata"].setdefault("source", "draft")
+
+    payloads = row_payloads + _draft_project_session_payloads(config, project, include_content=True)
+    payloads.extend(_curated_session_payloads(config, project, include_content=True))
+    by_path: dict[str, dict] = {}
+    for payload in payloads:
+        path = payload.get("path")
+        if path:
+            by_path[path] = payload
+    payloads = list(by_path.values())
+
+    merged_ids: dict[str, str] = {}
+    for payload in payloads:
+        for sid in payload.get("session_ids") or []:
+            merged_ids[sid] = payload.get("path", "")
+
+    payloads = [
+        p for p in payloads
+        if (
+            (not exclude_session_id or p.get("session_id") != exclude_session_id)
+            and (
+                p.get("session_id") not in merged_ids
+                or merged_ids[p.get("session_id")] == p.get("path")
+            )
+        )
+    ]
+    payloads.sort(
+        key=lambda p: p.get("ended_at") or p.get("created_at") or p.get("started_at") or "",
+        reverse=True,
+    )
+    return payloads[:limit]
+
+
+def _yaml_scalar(value: str | None) -> str:
+    return json_mod.dumps(value or "")
+
+
+def _build_session_summary_page(
+    content: str,
+    *,
+    one_line_summary: str,
+    project: dict,
+    session: dict,
+    ended_at: str,
+    draft_created_at: str,
+) -> str:
+    return (
+        "---\n"
+        f"summary: {_yaml_scalar(one_line_summary)}\n"
+        "tags: [session]\n"
+        f"project_id: {_yaml_scalar(project['id'])}\n"
+        f"project_name: {_yaml_scalar(project['name'])}\n"
+        f"agent: {_yaml_scalar(session.get('agent'))}\n"
+        f"session_id: {_yaml_scalar(session['id'])}\n"
+        f"started_at: {_yaml_scalar(session.get('started_at'))}\n"
+        f"ended_at: {_yaml_scalar(ended_at)}\n"
+        f"working_dir: {_yaml_scalar(session.get('working_dir'))}\n"
+        f"created_at: {_yaml_scalar(draft_created_at)}\n"
+        "---\n\n"
+        f"{content.strip()}\n"
+    )
+
+
+def _active_session_id_from_env() -> str | None:
+    return os.environ.get("AKW_SESSION_ID") or os.environ.get("AKW_GROUP_ID")
 
 
 def _match_segment_for_draft_path(conn, group_id: str, draft_path: str) -> dict | None:
@@ -448,105 +747,268 @@ def groups(project: str | None):
     conn.close()
 
 
-# --- group lifecycle subgroup (used by hooks and scripts) ---
+# --- session lifecycle subgroup (used by hooks and scripts) ---
+
+@main.group("session")
+def session_group():
+    """Session lifecycle and summary commands."""
+
+
+main.add_command(session_group)
+
 
 @main.group()
 def group():
-    """Group lifecycle commands (used by hooks and scripts)."""
+    """Deprecated legacy alias for session lifecycle commands."""
     pass
 
 
 main.add_command(group)
 
 
-@group.command("start")
-@click.option("--group-id", "-g", default=None, help="Group ID to continue (omit for new group).")
-@click.option("--project", "-p", default=None, help="Project name or ID.")
-@click.option("--agent", "-a", default="claude", help="Agent name.")
-@click.option("--working-dir", default=None, help="Working directory path metadata.")
-@click.option("--json", "json_out", is_flag=True, help="Emit group_id, segment_start_at, pending counts, and recommended_context as JSON (parity with MCP group_start).")
-def group_start(
+def _session_start_impl(
     group_id: str | None,
     project: str | None,
     agent: str,
     working_dir: str | None,
     json_out: bool,
-):
-    """Start a new group (or continue one). Prints group_id to stdout for hook capture."""
+    create_project_folder: bool,
+) -> None:
     config = load_config()
+    memory.ensure_memory_dirs(config.memory_dir)
     conn = storage.connect(config.sessions_db)
 
-    project_id: str | None = None
-    project_obj: dict | None = None
-    if project:
-        for p in storage.list_projects(conn):
-            if p["id"] == project or p["name"] == project:
-                project_id = p["id"]
-                project_obj = p
-                break
-        if project_id is None:
-            path = working_dir or os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd())
-            new_project = storage.create_project(conn, project, path)
-            project_id = new_project["id"]
-            project_obj = new_project
+    wd = working_dir or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    project_obj = _resolve_project(config, conn, project, wd)
+    session_folder = _ensure_project_session_folder(config, project_obj, create_project_folder)
+    display_wd = _display_path(wd)
 
-    md: dict = {"agent": agent}
-    if project_id:
-        md["project_id"] = project_id
-    if working_dir:
-        md["working_dir"] = working_dir
+    md: dict = {"agent": agent, "project_id": project_obj["id"], "project_name": project_obj["name"]}
+    if display_wd:
+        md["working_dir"] = display_wd
+    md["session_folder"] = session_folder
 
-    result = storage.start_group(
-        conn, group_id=group_id, agent=agent, metadata=md,
+    result = storage.start_session(
+        conn,
+        session_id=group_id,
+        project_id=project_obj["id"],
+        project_name=project_obj["name"],
+        agent=agent,
+        working_dir=display_wd,
+        metadata=md,
     )
-
     if json_out:
-        duckdb_conn = search.connect(config.search_db)
-        if config.memory_dir.exists():
-            search.sync_from_files(duckdb_conn, config.memory_dir)
         payload: dict = {
-            "group_id": result["group_id"],
-            "segment_start_at": result["segment_start_at"],
-            "pending": _pending_counts(conn),
-            "recommended_context": _get_recommended_context(duckdb_conn, config.memory_dir, project_obj),
+            "session_id": result["id"],
+            "group_id": result["id"],
+            "started_at": result["started_at"],
+            "segment_start_at": result["started_at"],
+            "project": {
+                "id": project_obj["id"],
+                "name": project_obj["name"],
+                "path": _display_path(project_obj.get("path")),
+                "session_folder": session_folder,
+            },
+            "latest_summaries": _recent_session_payloads(
+                config,
+                conn,
+                project_obj,
+                limit=5,
+                exclude_session_id=result["id"],
+            ),
         }
-        if result.get("idle_closed_segment"):
-            payload["idle_closed_segment"] = result["idle_closed_segment"]
-        duckdb_conn.close()
         _emit_json(payload)
     else:
-        click.echo(result["group_id"])
+        click.echo(result["id"])
     conn.close()
+
+
+@session_group.command("start")
+@click.option("--session-id", "--group-id", "-g", "group_id", default=None, help="Session ID to use (omit for new session).")
+@click.option("--project", "-p", default=None, help="Project name or ID.")
+@click.option("--agent", "-a", default="claude", help="Agent name.")
+@click.option("--working-dir", default=None, help="Working directory path metadata.")
+@click.option("--create-project-folder", is_flag=True, help="Create 1_drafts/sessions/<project> if missing.")
+@click.option("--json", "json_out", is_flag=True, help="Emit session metadata and latest project summaries as JSON.")
+def session_start(
+    group_id: str | None,
+    project: str | None,
+    agent: str,
+    working_dir: str | None,
+    create_project_folder: bool,
+    json_out: bool,
+):
+    """Start a new session. Prints session_id to stdout for hook capture."""
+    _session_start_impl(group_id, project, agent, working_dir, json_out, create_project_folder)
+
+
+@group.command("start")
+@click.option("--group-id", "-g", default=None, help="Deprecated alias for --session-id.")
+@click.option("--project", "-p", default=None, help="Project name or ID.")
+@click.option("--agent", "-a", default="claude", help="Agent name.")
+@click.option("--working-dir", default=None, help="Working directory path metadata.")
+@click.option("--create-project-folder", is_flag=True, help="Create 1_drafts/sessions/<project> if missing.")
+@click.option("--json", "json_out", is_flag=True, help="Emit session metadata and latest project summaries as JSON.")
+def group_start(
+    group_id: str | None,
+    project: str | None,
+    agent: str,
+    working_dir: str | None,
+    create_project_folder: bool,
+    json_out: bool,
+):
+    """Deprecated alias for `akw session start`."""
+    _session_start_impl(group_id, project, agent, working_dir, json_out, create_project_folder)
 
 
 @group.command("end")
 @click.option("--group-id", "-g", "group_id", default=None, help="Group ID to end (default: most recent open).")
 def group_end(group_id: str | None):
-    """End the current segment of a group. Idempotent."""
+    """Deprecated alias guard. Use `akw session close` with a summary."""
+    click.echo(
+        "Session summary required. Run `akw session close --content-file <summary.md>` before ending.",
+        err=True,
+    )
+    raise SystemExit(1)
+
+
+def _session_close_impl(
+    session_id: str | None,
+    content: str | None,
+    content_file: str | None,
+    summary: str | None,
+    json_out: bool,
+) -> None:
+    if content is None and content_file is None:
+        click.echo("Provide --content or --content-file.", err=True)
+        raise SystemExit(2)
+    if content_file:
+        content = Path(content_file).read_text(encoding="utf-8")
+    assert content is not None
+
     config = load_config()
+    memory.ensure_memory_dirs(config.memory_dir)
     conn = storage.connect(config.sessions_db)
 
-    gid = group_id
-    if gid is None:
-        open_groups = storage.get_open_groups(conn)
-        if not open_groups:
-            click.echo("No open group to end.", err=True)
-            conn.close()
-            return
-        gid = max(open_groups, key=lambda g: g["latest_at"])["group_id"]
+    sid = session_id or _active_session_id_from_env()
+    session = storage.get_open_session(conn, sid) if sid else storage.get_open_session(conn, latest=True)
+    if session is None:
+        click.echo("No open session to close.", err=True)
+        conn.close()
+        raise SystemExit(1)
 
-    result = storage.end_group(conn, gid, kind="end")
-    if result is None:
-        click.echo(f"Group has no turns: {gid}", err=True)
+    project = storage.get_project(conn, session["project_id"])
+    if project is None:
+        project = {
+            "id": session["project_id"],
+            "name": session["project_name"],
+            "path": session.get("working_dir") or "",
+        }
+    session_folder = _ensure_project_session_folder(config, project, create=True)
+
+    redacted, findings = sanitizer.redact(content)
+    title = _first_heading(redacted) or "Session Summary"
+    one_line = summary or next(
+        (
+            line.strip()
+            for line in redacted.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ),
+        title,
+    )
+    one_line = one_line[:200]
+    ended_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    created_at = ended_at
+    draft_path = (
+        f"{session_folder}/"
+        f"{session['id'][:8]}-{paths.compact_iso(ended_at)}.md"
+    )
+    page_content = _build_session_summary_page(
+        redacted,
+        one_line_summary=one_line,
+        project=project,
+        session=session,
+        ended_at=ended_at,
+        draft_created_at=created_at,
+    )
+
+    try:
+        memory.create_page(config.memory_dir, draft_path, page_content)
+    except FileExistsError:
+        click.echo(f"Session summary already exists: {draft_path}", err=True)
+        conn.close()
+        raise SystemExit(1)
+
+    storage.create_memory_edit(
+        conn,
+        draft_path,
+        "draft",
+        "create",
+        one_line,
+        group_id=session["id"],
+    )
+    storage.upsert_draft_state(
+        conn,
+        draft_path=draft_path,
+        group_id=session["id"],
+        segment_start_at=session["started_at"],
+        segment_end_at=ended_at,
+    )
+    closed = storage.close_session(
+        conn,
+        session["id"],
+        draft_path=draft_path,
+        title=title,
+        summary=one_line,
+        ended_at=ended_at,
+        metadata={"redactions": findings} if findings else {},
+    )
+    assert closed is not None
+
+    payload = _session_summary_payload(config, closed, include_content=True)
+    if json_out:
+        _emit_json(payload)
     else:
-        click.echo(gid)
+        click.echo(f"Closed session: {session['id']}")
+        click.echo(f"Summary: {draft_path}")
     conn.close()
 
 
-@group.command("status")
-@click.option("--json", "json_out", is_flag=True, help="Emit status as JSON (parity with MCP group_status).")
-def group_status(json_out: bool):
-    """Show the most recent open group + its segment."""
+@session_group.command("close")
+@click.option("--session-id", default=None, help="Session ID to close (default: active/latest open).")
+@click.option("--content", "content", default=None, help="Full markdown summary content.")
+@click.option("--content-file", "content_file", type=click.Path(exists=True, dir_okay=False), default=None, help="Read summary content from a file.")
+@click.option("--summary", "summary", default=None, help="One-line summary for frontmatter and recent lists.")
+@click.option("--json", "json_out", is_flag=True, help="Emit created draft metadata as JSON.")
+def session_close(
+    session_id: str | None,
+    content: str | None,
+    content_file: str | None,
+    summary: str | None,
+    json_out: bool,
+):
+    """Close the active session by writing one durable summary draft."""
+    _session_close_impl(session_id, content, content_file, summary, json_out)
+
+
+@group.command("close")
+@click.option("--session-id", "--group-id", "session_id", default=None, help="Session/group ID to close (default: active/latest open).")
+@click.option("--content", "content", default=None, help="Full markdown summary content.")
+@click.option("--content-file", "content_file", type=click.Path(exists=True, dir_okay=False), default=None, help="Read summary content from a file.")
+@click.option("--summary", "summary", default=None, help="One-line summary for frontmatter and recent lists.")
+@click.option("--json", "json_out", is_flag=True, help="Emit created draft metadata as JSON.")
+def group_close(
+    session_id: str | None,
+    content: str | None,
+    content_file: str | None,
+    summary: str | None,
+    json_out: bool,
+):
+    """Deprecated alias for `akw session close`."""
+    _session_close_impl(session_id, content, content_file, summary, json_out)
+
+
+def _session_status_impl(json_out: bool) -> None:
     config = load_config()
     if not config.sessions_db.exists():
         if json_out:
@@ -556,41 +1018,90 @@ def group_status(json_out: bool):
         return
 
     conn = storage.connect(config.sessions_db)
-    open_groups = storage.get_open_groups(conn)
-    if not open_groups:
+    env_session_id = _active_session_id_from_env()
+    session = storage.get_open_session(conn, env_session_id) if env_session_id else None
+    if session is None:
+        session = storage.get_open_session(conn, latest=True)
+    if session is None:
         if json_out:
-            _emit_json({"group_id": None, "segment_start_at": None, "segment_turn_count": 0})
+            _emit_json({"session_id": None, "group_id": None, "segment_start_at": None, "segment_turn_count": 0})
         else:
-            click.echo("No active group.")
+            click.echo("No active session.")
         conn.close()
         return
 
-    chosen = max(open_groups, key=lambda g: g["latest_at"])
-    gid = chosen["group_id"]
-    md = chosen.get("start_marker_metadata") or {}
-    seg_turns = storage.get_current_segment_turns(conn, gid)
-    turn_count = sum(1 for t in seg_turns if t["kind"] == "turn")
-    seg_start = next((t["created_at"] for t in seg_turns if t["kind"] == "start"), None)
-
     if json_out:
         _emit_json({
-            "group_id": gid,
-            "segment_start_at": seg_start,
-            "segment_turn_count": turn_count,
-            "agent": md.get("agent"),
-            "project_id": md.get("project_id"),
-            "latest_at": chosen["latest_at"],
+            "session_id": session["id"],
+            "group_id": session["id"],
+            "segment_start_at": session["started_at"],
+            "segment_turn_count": 0,
+            "agent": session.get("agent"),
+            "project_id": session.get("project_id"),
+            "project_name": session.get("project_name"),
+            "latest_at": session["started_at"],
         })
         conn.close()
         return
 
-    click.echo(f"Group:           {gid}")
-    click.echo(f"Agent:           {md.get('agent', '?')}")
-    click.echo(f"Project:         {md.get('project_id') or '(none)'}")
-    click.echo(f"Segment start:   {seg_start[:19] if seg_start else '(none)'}")
-    click.echo(f"Latest activity: {chosen['latest_at'][:19]}")
-    click.echo(f"Turns:           {turn_count}")
+    click.echo(f"Session:         {session['id']}")
+    click.echo(f"Agent:           {session.get('agent', '?')}")
+    click.echo(f"Project:         {session.get('project_name') or session.get('project_id')}")
+    click.echo(f"Started:         {session['started_at'][:19]}")
+    click.echo("Summary:         not saved")
     conn.close()
+
+
+@session_group.command("status")
+@click.option("--json", "json_out", is_flag=True, help="Emit status as JSON.")
+def session_status(json_out: bool):
+    """Show the most recent open session."""
+    _session_status_impl(json_out)
+
+
+@group.command("status")
+@click.option("--json", "json_out", is_flag=True, help="Emit status as JSON.")
+def group_status(json_out: bool):
+    """Deprecated alias for `akw session status`."""
+    _session_status_impl(json_out)
+
+
+def _session_recent_impl(project: str | None, working_dir: str | None, limit: int, json_out: bool) -> None:
+    config = load_config()
+    memory.ensure_memory_dirs(config.memory_dir)
+    conn = storage.connect(config.sessions_db)
+    wd = working_dir or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    project_obj = _resolve_project(config, conn, project, wd)
+    env_session_id = _active_session_id_from_env()
+    current = storage.get_open_session(conn, env_session_id) if env_session_id else None
+    payload = _recent_session_payloads(
+        config,
+        conn,
+        project_obj,
+        limit=limit,
+        exclude_session_id=current["id"] if current else None,
+    )
+
+    if json_out:
+        _emit_json(payload)
+    else:
+        if not payload:
+            click.echo("No recent session summaries.")
+        for item in payload:
+            click.echo(f"{item['ended_at']}  {item['title']}  {item['path']}")
+            if item.get("content"):
+                click.echo(item["content"])
+    conn.close()
+
+
+@session_group.command("recent")
+@click.option("--project", "-p", default=None, help="Project name or ID. Defaults to resolved current project.")
+@click.option("--working-dir", default=None, help="Working directory for project resolution.")
+@click.option("--limit", default=5, show_default=True, help="Maximum summaries to return.")
+@click.option("--json", "json_out", is_flag=True, help="Emit recent summaries as JSON.")
+def session_recent(project: str | None, working_dir: str | None, limit: int, json_out: bool):
+    """Show recent closed session summaries for the current project."""
+    _session_recent_impl(project, working_dir, limit, json_out)
 
 
 @group.command("list")
@@ -638,92 +1149,21 @@ def group_context():
 
 @group.command("prompt")
 def group_prompt():
-    """Save user prompt from UserPromptSubmit hook. Paired with next Stop response."""
-    config = load_config()
-    try:
-        hook_data = json_mod.load(sys.stdin)
-    except (json_mod.JSONDecodeError, ValueError):
-        return
-
-    prompt = hook_data.get("prompt", "")
-    if not prompt:
-        return
-
-    if len(prompt) > 200_000:
-        prompt = prompt[:200_000] + "..."
-
-    prompt_file = config.data_dir / "pending_prompt.txt"
-    prompt_file.parent.mkdir(parents=True, exist_ok=True)
-    prompt_file.write_text(prompt)
+    """Deprecated no-op. Raw prompt capture is disabled."""
+    click.echo("Deprecated: raw prompt capture is disabled. Use `akw session close` at session end.", err=True)
 
 
 @group.command("turn")
 @click.option("--batch-size", "-b", default=10, help="Flush after this many buffered turns.")
 def group_turn(batch_size: int):
-    """Buffer a turn from Stop hook. Pairs with pending user prompt. Flushes every N turns."""
-    config = load_config()
-    conn = storage.connect(config.sessions_db)
-
-    open_groups = storage.get_open_groups(conn)
-    if not open_groups:
-        conn.close()
-        return
-    gid = max(open_groups, key=lambda g: g["latest_at"])["group_id"]
-
-    try:
-        hook_data = json_mod.load(sys.stdin)
-    except (json_mod.JSONDecodeError, ValueError):
-        conn.close()
-        return
-
-    assistant_msg = hook_data.get("last_assistant_message", "")
-    if not assistant_msg:
-        conn.close()
-        return
-
-    if len(assistant_msg) > 200_000:
-        assistant_msg = assistant_msg[:200_000] + "..."
-
-    prompt_file = config.data_dir / "pending_prompt.txt"
-    user_prompt = ""
-    if prompt_file.exists():
-        user_prompt = prompt_file.read_text()
-        prompt_file.unlink(missing_ok=True)
-
-    buffer_file = config.data_dir / "turn_buffer.jsonl"
-    turn_entry = json_mod.dumps({
-        "request": user_prompt or "(no prompt captured)",
-        "response": assistant_msg,
-    })
-    with open(buffer_file, "a") as f:
-        f.write(turn_entry + "\n")
-
-    with open(buffer_file) as f:
-        lines = f.readlines()
-
-    if len(lines) >= batch_size:
-        _flush_turn_buffer(conn, gid, buffer_file)
-
-    conn.close()
+    """Deprecated no-op. Raw turn capture is disabled."""
+    click.echo("Deprecated: raw turn capture is disabled. Use `akw session close` at session end.", err=True)
 
 
 @group.command("flush")
 def group_flush():
-    """Flush any buffered turns to the database. Called by SessionEnd hook."""
-    config = load_config()
-    conn = storage.connect(config.sessions_db)
-
-    open_groups = storage.get_open_groups(conn)
-    if not open_groups:
-        conn.close()
-        return
-    gid = max(open_groups, key=lambda g: g["latest_at"])["group_id"]
-
-    buffer_file = config.data_dir / "turn_buffer.jsonl"
-    if buffer_file.exists():
-        _flush_turn_buffer(conn, gid, buffer_file)
-
-    conn.close()
+    """Deprecated no-op. Raw turn buffers are disabled."""
+    click.echo("Deprecated: raw turn buffers are disabled. Use `akw session close` at session end.", err=True)
 
 
 @group.command("turns")
@@ -753,32 +1193,6 @@ def group_turns(group_id: str, segment_start: str | None):
         else:
             click.echo(f"[{kind:<10}] {ts}")
     conn.close()
-
-
-def _flush_turn_buffer(conn, group_id: str, buffer_file: Path) -> None:
-    """Read buffered turns from file, write to DB, and clear the buffer."""
-    from agent_knowledge.core import sanitizer
-
-    if not buffer_file.exists():
-        return
-
-    turns = []
-    with open(buffer_file) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    turn = json_mod.loads(line)
-                    req, _ = sanitizer.redact(turn.get("request", ""))
-                    resp, _ = sanitizer.redact(turn.get("response", ""))
-                    turns.append({"request": req, "response": resp})
-                except (json_mod.JSONDecodeError, ValueError):
-                    continue
-
-    if turns:
-        storage.create_turns(conn, group_id, turns)
-
-    buffer_file.unlink(missing_ok=True)
 
 
 # --- archive (Phase 4) ---
